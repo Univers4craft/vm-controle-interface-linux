@@ -752,6 +752,28 @@ class ConsolePage(Gtk.Box):
             new_btn.connect("clicked", lambda *_: self._on_request_new_session())
             self._menu_box.pack_start(new_btn, False, False, 0)
 
+            # ---- Presse-papier partagé -------------------------------
+            paste_btn = Gtk.Button()
+            paste_btn.get_style_context().add_class("menu-item")
+            paste_row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            paste_lbl = Gtk.Label(
+                label="📋  Coller le presse-papier dans la VM",
+                xalign=0)
+            paste_lbl.set_hexpand(True)
+            paste_kbd = Gtk.Label(label="Ctrl  Shift  V")
+            paste_kbd.get_style_context().add_class("kbd")
+            paste_row.pack_start(paste_lbl, True, True, 0)
+            paste_row.pack_end(paste_kbd, False, False, 0)
+            paste_btn.add(paste_row)
+            paste_btn.set_tooltip_text(
+                "Injecte le contenu du presse-papier local dans "
+                "la VM courante (utile si la synchro RDP automatique "
+                "ne fonctionne pas).")
+            paste_btn.connect(
+                "clicked", lambda *_: self._paste_clipboard_into_vm())
+            self._menu_box.pack_start(paste_btn, False, False, 0)
+
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
         sep.set_margin_top(6); sep.set_margin_bottom(6)
         self._menu_box.pack_start(sep, False, False, 0)
@@ -1048,6 +1070,50 @@ class ConsolePage(Gtk.Box):
         self._hide_menu()
         if callable(self._on_request_new):
             self._on_request_new()
+
+    def _paste_clipboard_into_vm(self):
+        """Injecte le presse-papier local dans la session courante.
+        - SSH (VTE)  : utilise Vte.Terminal.paste_clipboard().
+        - RDP         : tape le texte via xdotool dans la fenêtre xfreerdp.
+        Sert de secours quand la synchro presse-papier RDP automatique
+        (+clipboard) n'est pas disponible côté VM (Windows sans RDP
+        clipboard, GPO, etc.). Dans la majorité des cas, un simple
+        Ctrl+V dans la VM suffit déjà.
+        """
+        s = self._current
+        if s is None:
+            return
+        # Récupère le presse-papier local.
+        clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+        text = clip.wait_for_text() or ""
+        if not text:
+            return
+        # Ferme la popup pour rendre la VM focus.
+        self._hide_menu()
+
+        # SSH : on colle directement dans VTE.
+        if s.conn.get("protocol") == "ssh" and s.vte is not None:
+            try:
+                s.vte.feed_child(text.encode("utf-8"))
+            except Exception:
+                try:
+                    s.vte.paste_clipboard()
+                except Exception:
+                    pass
+            return
+
+        # RDP : on tape le texte via xdotool dans la fenêtre embarquée.
+        if not shutil.which("xdotool"):
+            return
+        # Petit délai pour laisser le focus revenir à xfreerdp.
+        def _do_type():
+            try:
+                subprocess.Popen(
+                    ["xdotool", "type", "--delay", "8", "--", text])
+            except OSError:
+                pass
+            return False
+        GLib.timeout_add(180, _do_type)
 
     def _shortcuts_for(self, conn):
         proto = conn.get("protocol", "rdp")
@@ -2448,13 +2514,21 @@ class VMShell(Gtk.Window):
 
     def _on_key(self, _w, e):
         kv = e.keyval
+        ctrl = bool(e.state & Gdk.ModifierType.CONTROL_MASK)
+        shift = bool(e.state & Gdk.ModifierType.SHIFT_MASK)
+        # Ctrl+Shift+V dans une session : injecte le presse-papier local.
+        if (ctrl and shift and kv in (Gdk.KEY_V, Gdk.KEY_v)
+                and self._stack.get_visible_child_name() == "console"
+                and self._console.has_sessions()):
+            self._console._paste_clipboard_into_vm()
+            return True
         # Ctrl+K or Ctrl+F -> focus search
-        if e.state & Gdk.ModifierType.CONTROL_MASK and kv in (Gdk.KEY_k, Gdk.KEY_f):
+        if ctrl and kv in (Gdk.KEY_k, Gdk.KEY_f):
             if self._search_entry:
                 self._search_entry.grab_focus()
             return True
         # Ctrl+N -> new connection
-        if e.state & Gdk.ModifierType.CONTROL_MASK and kv == Gdk.KEY_n:
+        if ctrl and kv == Gdk.KEY_n:
             self._on_add(); return True
         # Esc -> in console: open shortcuts menu (don't close session)
         if kv == Gdk.KEY_Escape and self._stack.get_visible_child_name() == "console":

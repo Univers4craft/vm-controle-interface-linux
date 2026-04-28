@@ -96,9 +96,25 @@ python3 vmshell.py
 | Touche | Action |
 |---|---|
 | `Échap` | Ouvre le menu de session (switch VM, fermer, ouvrir une autre VM) |
+| `Ctrl + Shift + V` | Colle le presse-papier local dans la VM courante |
 | `Ctrl + K` ou `Ctrl + F` | Focus la barre de recherche |
 | `Ctrl + N` | Nouvelle connexion |
 | Clic droit / molette sur une session | Ferme cette session |
+
+### Presse-papier partagé
+
+Le presse-papier est synchronisé automatiquement entre l'hôte Linux et toutes
+les VM RDP ouvertes (option `+clipboard` de `xfreerdp`). Pour copier d'une VM
+vers une autre :
+
+1. Copiez (`Ctrl+C`) dans la VM A — le texte arrive sur le presse-papier local.
+2. Bascule sur la VM B (Échap → clic sur la session).
+3. Collez (`Ctrl+V`) dans la VM B.
+
+Si la synchro automatique ne fonctionne pas (politiques GPO Windows, certains
+serveurs RDP), un bouton **📋 Coller le presse-papier dans la VM** est
+disponible dans le menu Échap (ou raccourci `Ctrl+Shift+V`) qui injecte
+directement le texte via `xdotool`.
 
 ---
 
