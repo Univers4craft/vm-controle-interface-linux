@@ -9,6 +9,8 @@ fonctionner en **mode kiosque plein écran** sous Linux. Il intègre `xfreerdp3`
 (ou `xfreerdp`) et un terminal VTE dans une interface GTK3 sombre, animée et
 optimisée GPU/CPU selon le matériel détecté automatiquement.
 
+![Aperçu de VMShell](docs/screenshot.png)
+
 > Cas d'usage : poste de travail unique dédié à la connexion sur des VM
 > Windows / Linux distantes, sans bureau visible — l'utilisateur final ne voit
 > que VMShell.
