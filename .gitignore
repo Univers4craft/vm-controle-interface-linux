@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Données utilisateur (jamais à committer — peuvent contenir des mots de passe)
+.config/vmshell/
+connections.json
+settings.json
+sessions.log
+crash.log
+
+# Éditeurs
+.vscode/
+.idea/
+*.swp
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Builds
+*.log
+*.broken-*

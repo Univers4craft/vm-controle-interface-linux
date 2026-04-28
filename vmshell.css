@@ -1,0 +1,351 @@
+/* ============================================================
+ * VMShell — Dark UI
+ * ============================================================ */
+
+@define-color bg0 #0b0d12;
+@define-color bg1 #11141b;
+@define-color bg2 #161a23;
+@define-color bg3 #1d222d;
+@define-color line rgba(255,255,255,0.06);
+@define-color line2 rgba(255,255,255,0.10);
+
+@define-color fg  #e8ecf3;
+@define-color fg2 #aab2c0;
+@define-color fg3 #6b7383;
+
+@define-color acc1 #6c7cff;
+@define-color acc2 #a86bff;
+@define-color ok   #22c55e;
+@define-color warn #f59e0b;
+@define-color err  #ef4444;
+@define-color info #38bdf8;
+
+window, .root {
+  background: transparent;
+  color: @fg;
+  font-family: "Inter", "Segoe UI", "Cantarell", sans-serif;
+  font-size: 13px;
+  margin: 0; padding: 0; border: 0;
+}
+decoration, decoration-overlay {
+  background: transparent;
+  border: 0; box-shadow: none; margin: 0; padding: 0; border-radius: 0;
+}
+
+/* Sidebar */
+.sidebar {
+  background: alpha(@bg1, 0.72);
+  border-right: 1px solid @line;
+  padding: 18px 14px;
+  min-width: 230px;
+}
+.brand { color: @fg; font-weight: 800; font-size: 15px; letter-spacing: 1.4px; }
+.brand-dot {
+  background: linear-gradient(135deg, @acc1, @acc2);
+  border-radius: 9px;
+  min-width: 26px; min-height: 26px;
+  color: white; font-weight: 900;
+}
+.nav-section {
+  color: @fg3;
+  font-size: 10px; font-weight: 700; letter-spacing: 1.4px;
+  margin: 14px 8px 6px 8px;
+}
+.nav-item {
+  background: transparent;
+  color: @fg2;
+  border: 0; border-radius: 10px;
+  padding: 9px 12px; margin: 1px 0;
+  font-weight: 600; box-shadow: none;
+}
+.nav-item:hover { background: @bg2; color: @fg; }
+.nav-item-active { background: alpha(@acc1, 0.18); color: @fg; }
+.nav-badge {
+  background: @bg3; color: @fg2;
+  border-radius: 8px; padding: 1px 7px;
+  font-size: 10px; font-weight: 700;
+}
+.nav-item-active .nav-badge { background: @acc1; color: white; }
+.nav-cta {
+  background: linear-gradient(135deg, @acc1, @acc2);
+  color: white;
+  border: 0; border-radius: 12px;
+  padding: 10px 14px; font-weight: 700;
+  box-shadow: 0 6px 18px alpha(@acc1, 0.35);
+}
+.nav-cta:hover { box-shadow: 0 10px 24px alpha(@acc1, 0.45); }
+.profile {
+  border-top: 1px solid @line;
+  margin-top: 10px; padding: 12px 6px 4px 6px;
+}
+.profile-avatar {
+  background: linear-gradient(135deg, @acc1, @acc2);
+  color: white; font-weight: 800;
+  border-radius: 999px;
+  min-width: 34px; min-height: 34px;
+}
+.profile-name { color: @fg; font-weight: 700; }
+.profile-role { color: @fg3; font-size: 11px; }
+
+/* Header */
+.greeting { color: @fg; font-size: 22px; font-weight: 800; }
+.subtitle { color: @fg3; font-size: 12px; }
+.search {
+  background: @bg2;
+  border: 1px solid @line;
+  border-radius: 12px;
+  padding: 8px 12px;
+  color: @fg;
+  caret-color: @acc1;
+}
+.search:focus { border-color: @acc1; }
+.kbd {
+  background: @bg3; color: @fg2;
+  border: 1px solid @line2; border-radius: 6px;
+  padding: 3px 8px; font-size: 11px; font-weight: 700;
+  letter-spacing: 0.5px;
+}
+.clock { color: @fg2; font-weight: 600; }
+
+/* Chips / buttons */
+.chip {
+  background: @bg2; color: @fg;
+  border: 1px solid @line; border-radius: 10px;
+  padding: 6px 12px; font-weight: 600; box-shadow: none;
+}
+.chip:hover { background: @bg3; }
+.chip-primary {
+  background: linear-gradient(135deg, @acc1, @acc2);
+  color: white; border: 0;
+}
+.chip-danger { color: @err; }
+.chip-danger:hover { background: alpha(@err, 0.15); }
+.chip-good   { color: #22c55e; border-color: alpha(#22c55e, 0.4); }
+.chip-good:hover  { background: alpha(#22c55e, 0.12); }
+.chip-warn   { color: #f59e0b; border-color: alpha(#f59e0b, 0.4); }
+.chip-warn:hover  { background: alpha(#f59e0b, 0.12); }
+.chip-icon {
+  background: @bg2; color: @fg;
+  border: 1px solid @line; border-radius: 10px;
+  padding: 6px; min-width: 32px; min-height: 32px;
+  box-shadow: none;
+}
+.chip-icon:hover { background: @bg3; }
+.bell-dot {
+  background: @err; border-radius: 999px;
+  min-width: 8px; min-height: 8px; margin: 4px;
+}
+
+/* KPI */
+.kpi-card {
+  background: alpha(@bg1, 0.72);
+  border: 1px solid @line;
+  border-radius: 16px;
+  padding: 14px 16px;
+}
+.kpi-card:hover { border-color: @line2; }
+.kpi-icon {
+  border-radius: 10px;
+  min-width: 36px; min-height: 36px;
+  font-size: 16px; color: white;
+}
+.kpi-blue   .kpi-icon { background: linear-gradient(135deg, #3b82f6, #6c7cff); }
+.kpi-amber  .kpi-icon { background: linear-gradient(135deg, #f59e0b, #f97316); }
+.kpi-violet .kpi-icon { background: linear-gradient(135deg, #a86bff, #ec4899); }
+.kpi-green  .kpi-icon { background: linear-gradient(135deg, #22c55e, #14b8a6); }
+.kpi-value { color: @fg; font-size: 22px; font-weight: 800; }
+.kpi-title { color: @fg2; font-weight: 600; }
+.kpi-sub   { color: @fg3; font-size: 11px; }
+
+/* Section */
+.section-title { color: @fg; font-size: 16px; font-weight: 800; }
+.section-sub   { color: @fg3; font-size: 12px; }
+.view-toggle {
+  background: @bg2; color: @fg2;
+  border: 1px solid @line; border-radius: 10px;
+  padding: 6px 10px; box-shadow: none;
+}
+.view-toggle:hover { color: @fg; }
+.view-toggle.active { background: alpha(@acc1, 0.18); color: @fg; }
+
+/* VM Card */
+.vm-card {
+  background: alpha(@bg1, 0.78);
+  border: 1px solid @line;
+  border-radius: 16px;
+  padding: 14px;
+  transition: border-color 200ms ease, box-shadow 250ms ease,
+              background-color 200ms ease;
+}
+.vm-card:hover {
+  border-color: @line2;
+  box-shadow: 0 12px 30px rgba(0,0,0,0.35);
+  background: alpha(@bg1, 0.92);
+}
+.vm-icon {
+  background: linear-gradient(135deg, #3b82f6, #6c7cff);
+  color: white; border-radius: 10px;
+  min-width: 36px; min-height: 36px;
+  font-size: 16px; font-weight: 800;
+}
+.vm-icon-ssh { background: linear-gradient(135deg, #22c55e, #14b8a6); }
+.vm-icon-windows { background: linear-gradient(135deg, #0078d4, #00a2ff); }
+.vm-icon-linux   { background: linear-gradient(135deg, #f59e0b, #d97706); }
+.vm-icon-macos   { background: linear-gradient(135deg, #6b7280, #9ca3af); }
+.pill {
+  background: @bg3; color: @fg2;
+  border-radius: 999px; padding: 2px 9px;
+  font-size: 10px; font-weight: 700; letter-spacing: 0.5px;
+}
+.pill-rdp { background: alpha(@acc1, 0.20); color: #b9c2ff; }
+.pill-ssh { background: alpha(@ok, 0.18);   color: #86efac; }
+.star { background: transparent; border: 0; color: @fg3; box-shadow: none; padding: 2px 6px; }
+.star:hover { color: @warn; }
+.star-on { color: @warn; }
+.kebab { padding: 2px 8px; }
+.vm-name { color: @fg; font-weight: 800; font-size: 14px; }
+.vm-meta { color: @fg3; font-size: 11px; }
+.tag {
+  background: @bg3; color: @fg2;
+  border-radius: 6px; padding: 1px 6px;
+  font-size: 10px; font-weight: 700;
+}
+.card-cta {
+  background: linear-gradient(135deg, @acc1, @acc2);
+  color: white; border: 0;
+  border-radius: 10px; padding: 8px 12px;
+  font-weight: 700;
+  box-shadow: 0 6px 16px alpha(@acc1, 0.30);
+}
+.card-cta:hover { box-shadow: 0 10px 22px alpha(@acc1, 0.45); }
+
+.status-dot { border-radius: 999px; min-width: 8px; min-height: 8px; }
+.status-text { font-size: 11px; font-weight: 700; }
+.status-online      { background: @ok;   color: @ok;   }
+.status-offline     { background: @err;  color: @err;  }
+.status-checking    { background: @info; color: @info; }
+.status-connecting  { background: @acc1; color: @acc1; }
+.status-maintenance { background: @warn; color: @warn; }
+
+/* List row */
+.vm-row {
+  background: alpha(@bg1, 0.78); border: 1px solid @line;
+  border-radius: 12px; padding: 10px 12px;
+}
+.vm-row:hover { border-color: @line2; }
+
+/* Footer */
+.footer-help { color: @fg3; font-size: 11px; }
+.footer-link, .link-btn {
+  background: transparent; color: @acc1;
+  border: 0; box-shadow: none; padding: 0;
+  font-weight: 700;
+}
+.footer-link:hover, .link-btn:hover { color: @acc2; }
+
+/* Empty */
+.empty-icon  { font-size: 48px; color: @fg3; }
+.empty-title { color: @fg; font-size: 16px; font-weight: 800; }
+.empty-sub   { color: @fg3; }
+
+/* Toast */
+.toast {
+  background: @bg3; color: @fg;
+  border: 1px solid @line2; border-radius: 12px;
+  padding: 10px 14px;
+  box-shadow: 0 16px 40px rgba(0,0,0,0.5);
+}
+
+/* Popover */
+popover, popover.background {
+  background: @bg2;
+  border: 1px solid @line2;
+  border-radius: 12px;
+  padding: 6px;
+}
+.menu-item {
+  background: transparent; color: @fg;
+  border: 0; border-radius: 8px;
+  padding: 8px 12px; box-shadow: none;
+}
+.menu-item:hover { background: @bg3; }
+.menu-item.active {
+  background: alpha(@accent, 0.18);
+  color: @fg;
+  border-left: 3px solid @accent;
+}
+.menu-item-danger { color: @err; }
+
+/* Form / dialog */
+.form-card {
+  background: @bg1;
+  border: 1px solid @line;
+  border-radius: 16px;
+  padding: 18px;
+}
+.form-title { color: @fg; font-size: 18px; font-weight: 800; }
+.form-sub   { color: @fg3; }
+.form-label { color: @fg2; font-weight: 700; font-size: 12px; }
+entry {
+  background: @bg2; color: @fg;
+  border: 1px solid @line; border-radius: 10px;
+  padding: 8px 10px; caret-color: @acc1;
+}
+entry:focus { border-color: @acc1; }
+combobox button {
+  background: @bg2; color: @fg;
+  border: 1px solid @line; border-radius: 10px;
+  padding: 6px 10px;
+}
+spinbutton {
+  background: @bg2; color: @fg;
+  border: 1px solid @line; border-radius: 10px;
+}
+checkbutton, radiobutton { color: @fg2; }
+checkbutton check, radiobutton radio {
+  background: @bg2; border: 1px solid @line2;
+  min-width: 14px; min-height: 14px;
+}
+checkbutton check:checked { background: @acc1; border-color: @acc1; }
+
+/* Console */
+.console-bg { background: #06080c; }
+.console-loading { color: @fg2; }
+.console-loading-icon { color: @acc1; font-size: 22px; }
+.shortcut-panel {
+  background: alpha(@bg1, 0.98);
+  border: 1px solid @line2;
+  border-radius: 0;
+  padding: 18px;
+  min-width: 380px;
+  box-shadow: none;
+}
+
+/* Scrollbars */
+scrollbar { background: transparent; border: 0; }
+scrollbar slider {
+  background: @bg3; min-width: 6px; min-height: 6px;
+  border-radius: 999px; border: 0;
+}
+scrollbar slider:hover { background: @line2; }
+
+/* FlowBox */
+flowbox, flowbox flowboxchild { background: transparent; }
+flowboxchild:selected, flowboxchild:focus {
+  background: transparent; outline: 0; box-shadow: none;
+}
+
+stack { background: transparent; }
+
+/* Quality indicators in the ESC info panel */
+.kpi-good { color: #22c55e; font-weight: 700; }
+.kpi-warn { color: #f59e0b; font-weight: 700; }
+.kpi-bad  { color: #ef4444; font-weight: 700; }
+
+/* Performance profile chips */
+.chip-active {
+  background: #4f46e5;
+  color: #ffffff;
+  border-color: #6366f1;
+}
+.chip-active label { color: #ffffff; }

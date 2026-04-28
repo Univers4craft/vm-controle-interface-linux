@@ -1,0 +1,7 @@
+[Desktop Entry]
+Name=VMShell
+Comment=Session VMShell — gestionnaire de connexions distantes
+Exec=/usr/local/bin/vmshell-session
+TryExec=/usr/local/bin/vmshell-session
+Type=Application
+DesktopNames=VMShell
