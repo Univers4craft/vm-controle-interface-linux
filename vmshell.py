@@ -1231,9 +1231,6 @@ class ConsolePage(Gtk.Box):
                    "/cert:ignore",
                    "/dynamic-resolution",
                    "+clipboard",
-                   # Input asynchrone : motion events transmis sans
-                   # attendre le rendu → selection au clic gauche fluide.
-                   "+async-input",
                    f"/drive:home,{home}",
                    "/printer",
                    "/usb:auto",
