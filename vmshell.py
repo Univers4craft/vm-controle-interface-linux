@@ -1231,6 +1231,9 @@ class ConsolePage(Gtk.Box):
                    "/cert:ignore",
                    "/dynamic-resolution",
                    "+clipboard",
+                   # Input asynchrone : motion events transmis sans
+                   # attendre le rendu → selection au clic gauche fluide.
+                   "+async-input",
                    f"/drive:home,{home}",
                    "/printer",
                    "/usb:auto",
@@ -1241,9 +1244,11 @@ class ConsolePage(Gtk.Box):
                 hw_ok = bool(HW_INFO.get("gpu_accel"))
                 if hw_ok:
                     # GPU dispo → H.264 progressif + RemoteFX vidéo (décodage assisté).
+                    # Pas de "thin-client:on" : il coalesce les frames et
+                    # rend la sélection au clic gauche saccadée.
                     cmd += ["/network:broadband",
                             "/bpp:32",
-                            "/gfx:AVC420:on,progressive:on,thin-client:on",
+                            "/gfx:AVC420:on,progressive:on",
                             "+rfx",
                             "/rfx-mode:video",
                             "+compression",
