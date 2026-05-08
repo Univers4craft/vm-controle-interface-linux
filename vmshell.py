@@ -1236,6 +1236,18 @@ class ConsolePage(Gtk.Box):
         header.pack_start(sub,   False, False, 0)
         self._menu_box.pack_start(header, False, False, 0)
 
+        # ---- Barre rapide (toujours visible) ----------------------------
+        # Évite d'avoir à ouvrir Outils → Mon PC ou Perf pour les
+        # actions/infos les plus fréquentes : batterie, mode perf,
+        # latence VM, volume.
+        try:
+            quickbar = self._build_menu_quickbar()
+            if quickbar is not None:
+                self._menu_box.pack_start(quickbar, False, False, 0)
+        except Exception as e:
+            print(f"[vmshell] quickbar erreur (non bloquant) : {e}",
+                  flush=True)
+
         # ---- Construction des 4 pages d'onglets -------------------------
         page_sessions = self._build_tab_sessions()
         page_infos    = self._build_tab_infos()
@@ -1340,6 +1352,156 @@ class ConsolePage(Gtk.Box):
         self._menu_box.pack_start(row, False, False, 0)
 
         self._menu_box.show_all()
+
+    # ---- Barre rapide (header du menu Échap) --------------------------
+    def _build_menu_quickbar(self):
+        """Barre horizontale persistante affichée sous le titre du menu.
+        Donne accès en 1 clic aux 4 leviers les plus utilisés :
+          • 🔋 batterie : pourcentage + temps restant (clic = Mon PC)
+          • ⚡ Mode perf : Tranquille ↔ Gamer (clic = bascule directe)
+          • 📡 Latence VM (clic = test de débit)
+          • 🔊 Volume (clic = Mon PC, section audio)
+        Les chips s'adaptent : sans batterie → masqué, sans VM → latence
+        masquée."""
+        bar = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        bar.set_margin_top(6)
+        bar.set_margin_bottom(2)
+        bar.get_style_context().add_class("menu-quickbar")
+
+        def _chip(label, tip, cb, css_extra=None):
+            b = Gtk.Button()
+            b.get_style_context().add_class("chip")
+            b.get_style_context().add_class("quick-chip")
+            if css_extra:
+                b.get_style_context().add_class(css_extra)
+            l = Gtk.Label(label=label)
+            l.set_use_markup(True)
+            b.add(l)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda *_: cb())
+            return b
+
+        # 🔋 Batterie ----------------------------------------------------
+        try:
+            top = self.get_toplevel()
+            pct = None
+            status = ""
+            if hasattr(top, "_read_battery_state"):
+                pct, status = top._read_battery_state()
+            sec, mode = estimate_battery_seconds()
+            if pct is not None:
+                if status and status.lower() == "full":
+                    bat_lbl = f"🔋 100 %"
+                    bat_cls = "kpi-good"
+                elif mode == "charge":
+                    bat_lbl = (f"🔌 {pct} %  ↑ "
+                               f"{fmt_duration(sec)}")
+                    bat_cls = "kpi-good"
+                else:
+                    icon = "🔋" if pct > 20 else "🪫"
+                    bat_lbl = (f"{icon} {pct} %"
+                               + (f"  · {fmt_duration(sec)}"
+                                  if sec else ""))
+                    if pct > 30:
+                        bat_cls = "kpi-good"
+                    elif pct > 15:
+                        bat_cls = "kpi-warn"
+                    else:
+                        bat_cls = "kpi-bad"
+                bar.pack_start(_chip(
+                    bat_lbl,
+                    "Cliquer pour ouvrir le panneau « Mon PC »",
+                    self._open_host_panel,
+                    bat_cls), False, False, 0)
+        except Exception:
+            pass
+
+        # ⚡ Mode perf (toggle direct) -----------------------------------
+        try:
+            cur = (self._perf_profile or "tranquille").lower()
+            if cur == "gamer":
+                perf_lbl = "🎮 Gamer  →  🌙"
+                perf_tip = ("Mode actuel : Gamer. Cliquer pour repasser "
+                            "en Tranquille (relance la session RDP).")
+                perf_target = "tranquille"
+            else:
+                perf_lbl = "🌙 Tranquille  →  🎮"
+                perf_tip = ("Mode actuel : Tranquille. Cliquer pour "
+                            "passer en Gamer (relance la session RDP).")
+                perf_target = "gamer"
+
+            def _toggle_perf(_t=perf_target):
+                try:
+                    self._set_profile(_t)
+                except Exception as e:
+                    print(f"[vmshell] _set_profile erreur : {e}",
+                          flush=True)
+            bar.pack_start(_chip(
+                perf_lbl, perf_tip, _toggle_perf,
+                "chip-active"), False, False, 0)
+        except Exception:
+            pass
+
+        # 📡 Latence VM (si session active) -----------------------------
+        try:
+            if self._current is not None:
+                s = self._current
+                self._refresh_latency_async(s)
+                if s.latency_ms is None:
+                    lat_lbl = "📡 …"
+                    lat_cls = None
+                else:
+                    lat_lbl = f"📡 {s.latency_ms} ms"
+                    lat_cls = ("kpi-good" if s.latency_ms < 30
+                               else "kpi-warn" if s.latency_ms < 80
+                               else "kpi-bad")
+                bar.pack_start(_chip(
+                    lat_lbl,
+                    "Cliquer pour lancer un test de débit complet "
+                    "vers cette VM.",
+                    self._open_speedtest_popup,
+                    lat_cls), False, False, 0)
+        except Exception:
+            pass
+
+        # 🔊 Volume (lecture rapide via pactl si dispo) -----------------
+        try:
+            vol = None
+            if shutil.which("pactl"):
+                try:
+                    out = subprocess.check_output(
+                        ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                        text=True, timeout=1.5,
+                        stderr=subprocess.DEVNULL)
+                    # Format: "... / NN% / ..." - on prend le 1er %.
+                    import re as _re
+                    m = _re.search(r"(\d+)%", out)
+                    if m:
+                        vol = int(m.group(1))
+                except (subprocess.SubprocessError, OSError):
+                    pass
+            if vol is not None:
+                if vol == 0:
+                    icon = "🔇"
+                elif vol < 33:
+                    icon = "🔈"
+                elif vol < 66:
+                    icon = "🔉"
+                else:
+                    icon = "🔊"
+                bar.pack_start(_chip(
+                    f"{icon} {vol} %",
+                    "Cliquer pour ouvrir le panneau « Mon PC » "
+                    "(volume, micro, luminosité).",
+                    self._open_host_panel), False, False, 0)
+        except Exception:
+            pass
+
+        # Si la barre est vide (aucune info dispo) → on ne la rend pas.
+        if not bar.get_children():
+            return None
+        return bar
 
     # ---- Onglets du menu Échap -----------------------------------------
     def _build_tab_sessions(self):
