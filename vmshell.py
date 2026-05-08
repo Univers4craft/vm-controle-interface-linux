@@ -23,6 +23,7 @@ Single-window GTK3 dark UI, fullscreen.
 
 import json
 import os
+import re
 import shlex
 import shutil
 import socket
@@ -185,6 +186,27 @@ def find_xfreerdp():
 # ---------------------------------------------------------------------------
 import signal as _signal
 
+# ---------------------------------------------------------------------------
+# Reaper SIGCHLD : évite l'accumulation de processus zombies issus des
+# multiples subprocess.Popen "feu et oublie" (alertes batterie, sons,
+# send-keys, pkexec, etc.).
+# ---------------------------------------------------------------------------
+def _reap_zombies(*_):
+    try:
+        while True:
+            pid, _st = os.waitpid(-1, os.WNOHANG)
+            if pid <= 0:
+                break
+    except (ChildProcessError, OSError):
+        pass
+
+
+try:
+    _signal.signal(_signal.SIGCHLD, _reap_zombies)
+except (ValueError, OSError):
+    # Pas critique : sur certaines plateformes / threads non principal.
+    pass
+
 _FROZEN_PIDS = set()
 
 # Process *comm* names safe to freeze. Anything not in here is left alone.
@@ -280,7 +302,9 @@ class ClipboardHistory:
         self._started = True
         # On lit le presse-papier toutes les 1.2s. C'est largement assez
         # rapide pour usage humain et bien plus discret que owner-change.
-        GLib.timeout_add(1200, self._tick)
+        # Polling clipboard : 2s suffit largement (humain ne copie pas
+        # plus vite) et économise ~40 % de lectures GTK.
+        GLib.timeout_add(2000, self._tick)
 
     def _tick(self):
         try:
@@ -456,10 +480,27 @@ def detect_monitors():
 # ---------------------------------------------------------------------------
 # Estimation autonomie batterie (depuis /sys/class/power_supply)
 # ---------------------------------------------------------------------------
+# Cache résultat batterie ~5s : évite de relire /sys/ à chaque tick UI
+# (quickbar, popup alimentation, _battery_watch_tick, miniatures...).
+_BAT_CACHE = {"t": 0.0, "val": (None, None)}
+_BAT_CACHE_TTL = 5.0
+
+
 def estimate_battery_seconds():
     """Estime le temps restant (s) en se basant sur energy_now / power_now
     ou charge_now / current_now selon ce que le noyau expose.
-    Retourne (seconds, mode) avec mode = 'discharge'|'charge'|None."""
+    Retourne (seconds, mode) avec mode = 'discharge'|'charge'|None.
+    Résultat caché ~5s."""
+    now = time.monotonic()
+    if now - _BAT_CACHE["t"] < _BAT_CACHE_TTL:
+        return _BAT_CACHE["val"]
+    val = _estimate_battery_seconds_uncached()
+    _BAT_CACHE["t"] = now
+    _BAT_CACHE["val"] = val
+    return val
+
+
+def _estimate_battery_seconds_uncached():
     try:
         base = "/sys/class/power_supply"
         if not os.path.isdir(base):
@@ -1475,8 +1516,7 @@ class ConsolePage(Gtk.Box):
                         text=True, timeout=1.5,
                         stderr=subprocess.DEVNULL)
                     # Format: "... / NN% / ..." - on prend le 1er %.
-                    import re as _re
-                    m = _re.search(r"(\d+)%", out)
+                    m = re.search(r"(\d+)%", out)
                     if m:
                         vol = int(m.group(1))
                 except (subprocess.SubprocessError, OSError):
@@ -3728,6 +3768,20 @@ class VMShell(Gtk.Window):
 
     # ---- Surveillance batterie ----------------------------------------
     def _read_battery_state(self):
+        # Cache 5s : appelé par quickbar, popup alim, _battery_watch_tick,
+        # _draw_thumb. Inutile de relire /sys/ chaque fois.
+        try:
+            cache = self.__dict__.get("_bat_state_cache")
+            now = time.monotonic()
+            if cache and (now - cache[0]) < 5.0:
+                return cache[1]
+        except Exception:
+            now = time.monotonic()
+        val = self._read_battery_state_uncached()
+        self._bat_state_cache = (now, val)
+        return val
+
+    def _read_battery_state_uncached(self):
         try:
             base = "/sys/class/power_supply"
             if not os.path.isdir(base):
