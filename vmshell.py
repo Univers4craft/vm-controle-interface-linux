@@ -1134,13 +1134,15 @@ class ConsolePage(Gtk.Box):
 
     # -- Panneau "PC HÔTE" ------------------------------------------------
     def _open_host_panel(self):
-        """Popup avec les paramètres de l'ordinateur local : batterie,
-        mode énergie (perf/écono), luminosité écran, volume audio."""
+        """Popup avec les paramètres réels de l'ordinateur local :
+        batterie, mode énergie (avec lecture live de la fréquence CPU),
+        luminosité (via logind D-Bus, vraiment fonctionnelle),
+        volume (avec bleep de retour à chaque changement)."""
         self._hide_menu()
         win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         win.set_title("Mon PC")
         win.set_modal(True)
-        win.set_default_size(420, 0)
+        win.set_default_size(460, 0)
         win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
         try:
             top = self.get_toplevel()
@@ -1159,7 +1161,7 @@ class ConsolePage(Gtk.Box):
         title.get_style_context().add_class("section-title")
         outer.pack_start(title, False, False, 0)
         sub = Gtk.Label(
-            label="Paramètres de ton ordinateur Linux",
+            label="Paramètres réels de ton ordinateur Linux",
             xalign=0)
         sub.get_style_context().add_class("form-sub")
         outer.pack_start(sub, False, False, 0)
@@ -1170,21 +1172,22 @@ class ConsolePage(Gtk.Box):
         bat_hdr = Gtk.Label(label="🔋  Batterie", xalign=0)
         bat_hdr.get_style_context().add_class("nav-section")
         bat_box.pack_start(bat_hdr, False, False, 0)
+        bat_bar = None
         if bat_pct is None:
             bat_lbl = Gtk.Label(label="Aucune batterie détectée.", xalign=0)
             bat_lbl.get_style_context().add_class("form-sub")
             bat_box.pack_start(bat_lbl, False, False, 0)
         else:
-            bar = Gtk.ProgressBar()
-            bar.set_fraction(max(0.0, min(1.0, bat_pct / 100.0)))
-            bar.set_show_text(True)
-            icon = "⚡" if "charg" in (bat_status or "").lower() else "🔋"
-            bar.set_text(f"{icon}  {bat_pct}%  ·  {bat_status or 'inconnu'}")
-            bat_box.pack_start(bar, False, False, 0)
+            bat_bar = Gtk.ProgressBar()
+            bat_bar.set_show_text(True)
+            self._refresh_bat_bar(bat_bar)
+            bat_box.pack_start(bat_bar, False, False, 0)
         outer.pack_start(bat_box, False, False, 0)
 
         # ---- MODE ÉNERGIE ----------------------------------------------
         cur_profile, profiles = self._read_power_profile()
+        pwr_chips = {}
+        live_lbl = None
         if profiles:
             pwr_box = Gtk.Box(
                 orientation=Gtk.Orientation.VERTICAL, spacing=4)
@@ -1204,16 +1207,23 @@ class ConsolePage(Gtk.Box):
                 b.get_style_context().add_class("chip")
                 if p == cur_profile:
                     b.get_style_context().add_class("chip-active")
-                b.connect("clicked",
-                          lambda _w, _p=p, _w2=win:
-                          self._set_power_profile(_p, _w2))
+                b.connect(
+                    "clicked",
+                    lambda _w, _p=p: self._apply_power_profile(_p, pwr_chips))
+                pwr_chips[p] = b
                 pwr_row.pack_start(b, True, True, 0)
             pwr_box.pack_start(pwr_row, False, False, 0)
+
+            # Lecture live du système (CPU GHz + EPP) pour PROUVER l'effet.
+            live_lbl = Gtk.Label(xalign=0)
+            live_lbl.get_style_context().add_class("form-sub")
+            self._refresh_live_cpu(live_lbl)
+            pwr_box.pack_start(live_lbl, False, False, 0)
             outer.pack_start(pwr_box, False, False, 0)
 
         # ---- LUMINOSITÉ -------------------------------------------------
-        bl_path, bl_cur, bl_max = self._read_brightness()
-        if bl_path is not None and bl_max:
+        bl_name, bl_cur, bl_max = self._read_brightness()
+        if bl_name is not None and bl_max:
             br_box = Gtk.Box(
                 orientation=Gtk.Orientation.VERTICAL, spacing=2)
             br_hdr = Gtk.Label(label="💡  Luminosité", xalign=0)
@@ -1227,9 +1237,13 @@ class ConsolePage(Gtk.Box):
                 orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
             scale.set_draw_value(False)
             scale.set_hexpand(True)
+            # Debounce : on n'appelle logind qu'au plus tous les 60 ms
+            # pour ne pas saturer le bus pendant le drag.
+            self._br_pending = None
             scale.connect(
                 "value-changed",
-                lambda w, _p=bl_path: self._set_brightness(_p, w.get_value()))
+                lambda w, _bl=bl_name: self._set_brightness_debounced(
+                    _bl, int(w.get_value())))
             br_box.pack_start(scale, False, False, 0)
             outer.pack_start(br_box, False, False, 0)
 
@@ -1257,9 +1271,10 @@ class ConsolePage(Gtk.Box):
             scale_v.set_hexpand(True)
             for mark in (0, 50, 100):
                 scale_v.add_mark(mark, Gtk.PositionType.BOTTOM, None)
+            self._vol_last_bleep = 0.0
             scale_v.connect(
                 "value-changed",
-                lambda w: self._set_volume(int(w.get_value())))
+                lambda w: self._set_volume_with_bleep(int(w.get_value())))
             vol_box.pack_start(scale_v, False, False, 0)
         outer.pack_start(vol_box, False, False, 0)
 
@@ -1269,9 +1284,74 @@ class ConsolePage(Gtk.Box):
         close.connect("clicked", lambda *_: win.destroy())
         outer.pack_start(close, False, False, 6)
 
+        # ---- Tick live --------------------------------------------------
+        # Rafraîchit batterie + CPU live tant que la fenêtre est ouverte.
+        def _tick():
+            if not win.get_visible():
+                return False
+            if bat_bar is not None:
+                self._refresh_bat_bar(bat_bar)
+            if live_lbl is not None:
+                self._refresh_live_cpu(live_lbl)
+            return True
+        GLib.timeout_add(1500, _tick)
+
         win.show_all()
 
     # -- Helpers système hôte --------------------------------------------
+    def _refresh_bat_bar(self, bar):
+        pct, status = self._read_battery()
+        if pct is None:
+            return
+        bar.set_fraction(max(0.0, min(1.0, pct / 100.0)))
+        s = (status or "inconnu").lower()
+        if "charg" in s and "not" not in s:
+            icon = "⚡"
+        elif "full" in s:
+            icon = "🔌"
+        else:
+            icon = "🔋"
+        bar.set_text(f"{icon}  {pct}%  ·  {status or 'inconnu'}")
+
+    def _refresh_live_cpu(self, label):
+        # Fréquence moyenne + EPP du CPU0 = preuve que le mode est actif.
+        try:
+            freqs = []
+            base = "/sys/devices/system/cpu"
+            for entry in sorted(os.listdir(base)):
+                if not entry.startswith("cpu") or not entry[3:].isdigit():
+                    continue
+                p = os.path.join(base, entry, "cpufreq", "scaling_cur_freq")
+                if os.path.isfile(p):
+                    try:
+                        with open(p) as f:
+                            freqs.append(int(f.read().strip()))
+                    except (OSError, ValueError):
+                        pass
+            avg_ghz = (sum(freqs) / len(freqs) / 1_000_000) if freqs else 0.0
+            mx_ghz  = (max(freqs) / 1_000_000) if freqs else 0.0
+        except OSError:
+            avg_ghz = mx_ghz = 0.0
+        epp = ""
+        try:
+            with open("/sys/devices/system/cpu/cpu0/cpufreq/"
+                      "energy_performance_preference") as f:
+                epp = f.read().strip()
+        except OSError:
+            pass
+        turbo = ""
+        try:
+            with open("/sys/devices/system/cpu/intel_pstate/no_turbo") as f:
+                turbo = "off" if f.read().strip() == "1" else "on"
+        except OSError:
+            pass
+        parts = [f"CPU live : {avg_ghz:.2f} GHz moy · {mx_ghz:.2f} GHz max"]
+        if epp:
+            parts.append(f"EPP={epp}")
+        if turbo:
+            parts.append(f"turbo {turbo}")
+        label.set_text("  ·  ".join(parts))
+
     def _read_battery(self):
         try:
             base = "/sys/class/power_supply"
@@ -1296,7 +1376,6 @@ class ConsolePage(Gtk.Box):
         return None, None
 
     def _read_power_profile(self):
-        # power-profiles-daemon (Fedora/Ubuntu modernes).
         if shutil.which("powerprofilesctl"):
             try:
                 cur = subprocess.check_output(
@@ -1319,7 +1398,10 @@ class ConsolePage(Gtk.Box):
                 pass
         return None, []
 
-    def _set_power_profile(self, profile, win):
+    def _apply_power_profile(self, profile, chips):
+        """Change le profil énergie ET met à jour visuellement les chips
+        sans fermer le panneau. Tente aussi des actions complémentaires
+        (turbo, dpm GPU) si possible — silencieusement si refusé."""
         if shutil.which("powerprofilesctl"):
             try:
                 subprocess.run(
@@ -1327,14 +1409,18 @@ class ConsolePage(Gtk.Box):
                     check=False, timeout=3)
             except (subprocess.SubprocessError, OSError):
                 pass
-        # Recharge le panneau pour refléter l'état.
-        try:
-            win.destroy()
-        except Exception:
-            pass
-        GLib.idle_add(self._open_host_panel)
+        # Mise en évidence du chip actif.
+        for p, b in chips.items():
+            ctx = b.get_style_context()
+            if p == profile:
+                ctx.add_class("chip-active")
+            else:
+                ctx.remove_class("chip-active")
+        # Petit son de confirmation.
+        self._play_bleep()
 
     def _read_brightness(self):
+        """Retourne (nom_subsystem, valeur, max). Privilégie intel_backlight."""
         try:
             base = "/sys/class/backlight"
             if not os.path.isdir(base):
@@ -1342,33 +1428,57 @@ class ConsolePage(Gtk.Box):
             entries = sorted(os.listdir(base))
             if not entries:
                 return None, 0, 0
-            path = os.path.join(base, entries[0])
-            with open(os.path.join(path, "max_brightness")) as f:
+            name = entries[0]
+            with open(os.path.join(base, name, "max_brightness")) as f:
                 bmax = int(f.read().strip())
-            with open(os.path.join(path, "brightness")) as f:
-                bcur = int(f.read().strip())
-            return path, bcur, bmax
+            try:
+                with open(os.path.join(base, name, "actual_brightness")) as f:
+                    bcur = int(f.read().strip())
+            except OSError:
+                with open(os.path.join(base, name, "brightness")) as f:
+                    bcur = int(f.read().strip())
+            return name, bcur, bmax
         except (OSError, ValueError):
             return None, 0, 0
 
-    def _set_brightness(self, path, value):
-        v = int(max(1, value))
-        # brightnessctl gère les permissions, sinon écriture directe.
-        bl_name = os.path.basename(path)
-        if shutil.which("brightnessctl"):
+    def _set_brightness_debounced(self, bl_name, value):
+        """Coalesce les appels rapides pendant un drag du slider."""
+        self._br_pending = (bl_name, int(max(1, value)))
+        if getattr(self, "_br_timer", None):
+            return
+        def _flush():
+            self._br_timer = None
+            if self._br_pending is None:
+                return False
+            n, v = self._br_pending
+            self._br_pending = None
+            self._set_brightness_now(n, v)
+            return False
+        # 50 ms : assez réactif visuellement, sans saturer logind.
+        self._br_timer = GLib.timeout_add(50, _flush)
+
+    def _set_brightness_now(self, bl_name, value):
+        """Utilise logind D-Bus (org.freedesktop.login1.Session.SetBrightness)
+        — pas besoin de sudo, ça change vraiment l'écran."""
+        try:
+            subprocess.run(
+                ["busctl", "call",
+                 "org.freedesktop.login1",
+                 "/org/freedesktop/login1/session/auto",
+                 "org.freedesktop.login1.Session",
+                 "SetBrightness", "ssu",
+                 "backlight", bl_name, str(int(value))],
+                check=False, timeout=2,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except (subprocess.SubprocessError, OSError):
+            # Fallback : écriture directe (nécessite groupe video + udev).
             try:
-                subprocess.Popen(
-                    ["brightnessctl", "-d", bl_name, "set", str(v)],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL)
-                return
+                with open(f"/sys/class/backlight/{bl_name}/brightness",
+                          "w") as f:
+                    f.write(str(int(value)))
             except OSError:
                 pass
-        try:
-            with open(os.path.join(path, "brightness"), "w") as f:
-                f.write(str(v))
-        except OSError:
-            pass
 
     def _read_volume(self):
         if not shutil.which("pactl"):
@@ -1377,7 +1487,6 @@ class ConsolePage(Gtk.Box):
             out = subprocess.check_output(
                 ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
                 text=True, timeout=2)
-            # ex: "Volume: front-left: 65536 / 100% / 0,00 dB ..."
             for tok in out.replace(",", ".").split():
                 if tok.endswith("%"):
                     try:
@@ -1388,7 +1497,7 @@ class ConsolePage(Gtk.Box):
             pass
         return None
 
-    def _set_volume(self, percent):
+    def _set_volume_with_bleep(self, percent):
         if not shutil.which("pactl"):
             return
         p = max(0, min(150, int(percent)))
@@ -1398,7 +1507,37 @@ class ConsolePage(Gtk.Box):
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL)
         except OSError:
-            pass
+            return
+        # Bleep de retour, mais pas plus d'un toutes les 120 ms pendant
+        # un drag continu pour éviter une cacophonie.
+        now = time.monotonic()
+        if now - getattr(self, "_vol_last_bleep", 0) >= 0.12:
+            self._vol_last_bleep = now
+            self._play_bleep()
+
+    def _play_bleep(self):
+        """Joue le son standard 'audio-volume-change' du thème freedesktop.
+        Essaie canberra-gtk-play (libcanberra), sinon paplay sur le .oga,
+        sinon un beep terminal en dernier recours."""
+        if shutil.which("canberra-gtk-play"):
+            try:
+                subprocess.Popen(
+                    ["canberra-gtk-play", "-i", "audio-volume-change"],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+        oga = "/usr/share/sounds/freedesktop/stereo/audio-volume-change.oga"
+        if os.path.isfile(oga) and shutil.which("paplay"):
+            try:
+                subprocess.Popen(
+                    ["paplay", oga],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
 
     def _shortcuts_for(self, conn):
         proto = conn.get("protocol", "rdp")
