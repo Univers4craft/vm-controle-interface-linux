@@ -4065,10 +4065,6 @@ class VMShell(Gtk.Window):
         self._resume_btn.set_no_show_all(True)
         head.pack_start(self._resume_btn, False, False, 0)
 
-        logout_btn = Gtk.Button(label="↪  Déconnexion")
-        logout_btn.get_style_context().add_class("chip")
-        logout_btn.connect("clicked", lambda *_: self._on_logout())
-
         shutdown_btn = Gtk.Button(label="⏼  Alimentation")
         shutdown_btn.get_style_context().add_class("chip")
         shutdown_btn.get_style_context().add_class("chip-danger")
@@ -4078,7 +4074,6 @@ class VMShell(Gtk.Window):
         shutdown_btn.connect("clicked",
                              lambda *_: self._open_power_menu())
 
-        head.pack_start(logout_btn, False, False, 0)
         head.pack_start(shutdown_btn, False, False, 0)
 
         main.pack_start(head, False, False, 0)
