@@ -151,6 +151,23 @@ def os_glyph(os_name: str):
     }.get((os_name or "").lower(), "💻")
 
 SESSION_LOG = None  # set after CONFIG_DIR exists
+_SESSION_LOG_MAX_BYTES = 2 * 1024 * 1024  # 2 MiB avant rotation
+
+
+def _rotate_session_log_if_needed(path):
+    """Rotation simple : si > 2 MiB on renomme en .1 (écrasé si existant)."""
+    try:
+        if path.exists() and path.stat().st_size > _SESSION_LOG_MAX_BYTES:
+            backup = path.with_suffix(path.suffix + ".1")
+            try:
+                if backup.exists():
+                    backup.unlink()
+            except OSError:
+                pass
+            path.rename(backup)
+    except OSError:
+        pass
+
 
 def log_session(event: str, conn: dict, extra: str = ""):
     """Append a session event to ~/.config/vmshell/sessions.log"""
@@ -158,6 +175,7 @@ def log_session(event: str, conn: dict, extra: str = ""):
     if SESSION_LOG is None:
         SESSION_LOG = CONFIG_DIR / "sessions.log"
     try:
+        _rotate_session_log_if_needed(SESSION_LOG)
         line = f"{datetime.now().isoformat(timespec='seconds')}\t{event}\t{conn.get('name','?')}\t{conn.get('protocol','?')}\t{conn.get('host','?')}:{conn.get('port','?')}\t{extra}\n"
         with open(SESSION_LOG, "a", encoding="utf-8") as f:
             f.write(line)
@@ -1248,9 +1266,6 @@ class ConsolePage(Gtk.Box):
                     pass
                 return False
             GLib.idle_add(_force_focus)
-
-    def _force_remote_redraw(self):
-        return False
 
     # -- Menu --------------------------------------------------------------
     def _populate_menu(self):
@@ -3389,21 +3404,6 @@ echo OK
             ("Capture d'écran (zone)",      "super+shift+s"),
         ]
 
-    def _send_keys(self, combo):
-        """Send a key combo to the remote window via xdotool."""
-        def do_send():
-            try:
-                # The xfreerdp plug already has keyboard focus by default
-                # since it grabs it. Just inject keys via XTest.
-                subprocess.Popen(["xdotool", "key", combo])
-                print(f"[vmshell] sent '{combo}'", flush=True)
-            except OSError as e:
-                print(f"[vmshell] xdotool error: {e}", flush=True)
-            return False
-
-        # Small delay so the popup has time to fully hide.
-        GLib.timeout_add(120, do_send)
-
     # -- RDP ---------------------------------------------------------------
     def _start_rdp(self, s):
         conn = s.conn
@@ -4784,6 +4784,37 @@ class VMShell(Gtk.Window):
         sub.get_style_context().add_class("form-sub")
         b.pack_start(title, False, False, 0)
         b.pack_start(sub,   False, False, 0)
+
+        # Boutons rapides : ouvrir le dossier config / copier le chemin.
+        path_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        path_row.set_margin_top(4)
+        open_btn = Gtk.Button(label="📁  Ouvrir le dossier")
+        open_btn.get_style_context().add_class("chip")
+        open_btn.set_tooltip_text(str(CONFIG_DIR))
+
+        def _open_cfg(*_):
+            try:
+                subprocess.Popen(["xdg-open", str(CONFIG_DIR)])
+            except OSError:
+                self._toast("xdg-open indisponible.")
+        open_btn.connect("clicked", _open_cfg)
+
+        copy_btn = Gtk.Button(label="📋  Copier le chemin")
+        copy_btn.get_style_context().add_class("chip")
+
+        def _copy_cfg(*_):
+            try:
+                clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+                clip.set_text(str(CONFIG_DIR), -1)
+                self._toast("Chemin copié.")
+            except Exception:
+                pass
+        copy_btn.connect("clicked", _copy_cfg)
+
+        path_row.pack_start(open_btn, False, False, 0)
+        path_row.pack_start(copy_btn, False, False, 0)
+        b.pack_start(path_row, False, False, 0)
 
         info = Gtk.Label(
             label=(f"• xfreerdp : {find_xfreerdp() or 'NON INSTALLÉ'}\n"
