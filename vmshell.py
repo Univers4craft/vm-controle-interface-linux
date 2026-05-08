@@ -1259,6 +1259,25 @@ class ConsolePage(Gtk.Box):
             br_box.pack_start(scale, False, False, 0)
             outer.pack_start(br_box, False, False, 0)
 
+        # ---- RÉSEAU BAS-LATENCE -----------------------------------------
+        net_state = self._read_network_state()
+        net_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        net_hdr = Gtk.Label(label="🌐  Réseau bas-latence", xalign=0)
+        net_hdr.get_style_context().add_class("nav-section")
+        net_box.pack_start(net_hdr, False, False, 0)
+        net_status = Gtk.Label(xalign=0)
+        net_status.set_line_wrap(True)
+        net_status.get_style_context().add_class("form-sub")
+        net_box.pack_start(net_status, False, False, 0)
+        net_btn = Gtk.Button()
+        net_btn.get_style_context().add_class("chip")
+        net_box.pack_start(net_btn, False, False, 0)
+        self._refresh_network_chip(net_btn, net_status)
+        net_btn.connect(
+            "clicked",
+            lambda _w: self._toggle_network_boost(net_btn, net_status))
+        outer.pack_start(net_box, False, False, 0)
+
         # ---- VOLUME -----------------------------------------------------
         vol = self._read_volume()
         vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
@@ -1550,6 +1569,174 @@ class ConsolePage(Gtk.Box):
                 return
             except OSError:
                 pass
+
+    # -- Réseau bas-latence ----------------------------------------------
+    def _read_network_state(self):
+        """Retourne dict avec l'état actuel : congestion control, qdisc,
+        wifi power_save, interface active."""
+        st = {"cc": "?", "qdisc": "?", "wifi_ps": None,
+              "iface": None, "iface_type": None}
+        try:
+            with open(
+                    "/proc/sys/net/ipv4/tcp_congestion_control") as f:
+                st["cc"] = f.read().strip()
+        except OSError:
+            pass
+        try:
+            with open("/proc/sys/net/core/default_qdisc") as f:
+                st["qdisc"] = f.read().strip()
+        except OSError:
+            pass
+        # Interface par défaut.
+        try:
+            out = subprocess.check_output(
+                ["ip", "-o", "route", "show", "default"],
+                text=True, timeout=1)
+            for tok in out.split():
+                if tok == "dev":
+                    idx = out.split().index("dev")
+                    st["iface"] = out.split()[idx + 1]
+                    break
+        except (subprocess.SubprocessError, OSError, ValueError):
+            pass
+        # Type WiFi/Ethernet via nmcli.
+        if st["iface"] and shutil.which("nmcli"):
+            try:
+                out = subprocess.check_output(
+                    ["nmcli", "-t", "-f", "DEVICE,TYPE", "d"],
+                    text=True, timeout=1)
+                for line in out.splitlines():
+                    parts = line.split(":")
+                    if len(parts) >= 2 and parts[0] == st["iface"]:
+                        st["iface_type"] = parts[1]
+                        break
+            except (subprocess.SubprocessError, OSError):
+                pass
+        # WiFi power_save (via iwconfig si dispo).
+        if st["iface_type"] == "wifi" and shutil.which("iwconfig"):
+            try:
+                out = subprocess.check_output(
+                    ["iwconfig", st["iface"]],
+                    text=True, timeout=1,
+                    stderr=subprocess.DEVNULL)
+                for line in out.splitlines():
+                    if "Power Management" in line:
+                        st["wifi_ps"] = (
+                            "off" if "off" in line.lower() else "on")
+                        break
+            except (subprocess.SubprocessError, OSError):
+                pass
+        return st
+
+    def _is_network_boosted(self, st=None):
+        if st is None:
+            st = self._read_network_state()
+        boosted = (st.get("cc") == "bbr" and st.get("qdisc") == "fq")
+        if st.get("iface_type") == "wifi":
+            boosted = boosted and (st.get("wifi_ps") == "off")
+        return boosted
+
+    def _refresh_network_chip(self, btn, status_lbl):
+        st = self._read_network_state()
+        active = self._is_network_boosted(st)
+        # Vide les enfants existants.
+        for c in btn.get_children():
+            btn.remove(c)
+        if active:
+            btn.set_label("✅  Bas-latence actif  ·  rétablir")
+            ctx = btn.get_style_context()
+            ctx.remove_class("chip-active")
+            ctx.add_class("chip-good")
+        else:
+            btn.set_label("🚀  Activer le mode bas-latence")
+            ctx = btn.get_style_context()
+            ctx.remove_class("chip-good")
+            ctx.add_class("chip-active")
+        wifi_txt = ""
+        if st.get("iface_type") == "wifi":
+            ps = st.get("wifi_ps") or "?"
+            wifi_txt = f"  ·  WiFi power-save : {ps}"
+        status_lbl.set_text(
+            f"Interface : {st.get('iface') or '?'}  "
+            f"({st.get('iface_type') or '?'}){wifi_txt}\n"
+            f"TCP : {st.get('cc')}  ·  qdisc : {st.get('qdisc')}")
+
+    def _toggle_network_boost(self, btn, status_lbl):
+        """Bascule le mode bas-latence. Demande pkexec une seule fois."""
+        st = self._read_network_state()
+        active = self._is_network_boosted(st)
+
+        # Action via pkexec — un seul prompt grâce au heredoc.
+        if not active:
+            script = r'''
+set +e
+# 1) Coupe le wifi power-save sur tout NM.
+for cn in $(nmcli -t -f NAME,TYPE c show 2>/dev/null \
+        | awk -F: '$2=="802-11-wireless"{print $1}'); do
+    nmcli c modify "$cn" 802-11-wireless.powersave 2 2>/dev/null
+done
+for dev in $(nmcli -t -f DEVICE,TYPE d 2>/dev/null \
+        | awk -F: '$2=="wifi"{print $1}'); do
+    iwconfig "$dev" power off 2>/dev/null
+done
+# 2) Active TCP BBR (best latency under load).
+modprobe tcp_bbr 2>/dev/null
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+sysctl -w net.core.default_qdisc=fq           >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_notsent_lowat=16384    >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_low_latency=1          >/dev/null 2>&1
+sysctl -w net.core.netdev_budget=600          >/dev/null 2>&1
+sysctl -w net.core.busy_poll=50               >/dev/null 2>&1
+sysctl -w net.core.busy_read=50               >/dev/null 2>&1
+echo OK
+'''
+        else:
+            script = r'''
+set +e
+# Restaure les valeurs Linux par défaut (Ubuntu/Mint).
+for cn in $(nmcli -t -f NAME,TYPE c show 2>/dev/null \
+        | awk -F: '$2=="802-11-wireless"{print $1}'); do
+    nmcli c modify "$cn" 802-11-wireless.powersave 0 2>/dev/null
+done
+for dev in $(nmcli -t -f DEVICE,TYPE d 2>/dev/null \
+        | awk -F: '$2=="wifi"{print $1}'); do
+    iwconfig "$dev" power on 2>/dev/null
+done
+sysctl -w net.ipv4.tcp_congestion_control=cubic    >/dev/null 2>&1
+sysctl -w net.core.default_qdisc=fq_codel           >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_notsent_lowat=4294967295     >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_low_latency=0                >/dev/null 2>&1
+sysctl -w net.core.netdev_budget=300                >/dev/null 2>&1
+sysctl -w net.core.busy_poll=0                      >/dev/null 2>&1
+sysctl -w net.core.busy_read=0                      >/dev/null 2>&1
+echo OK
+'''
+        # Désactive temporairement le bouton pour éviter double-clic.
+        btn.set_sensitive(False)
+
+        def _run():
+            ok = False
+            try:
+                r = subprocess.run(
+                    ["pkexec", "sh", "-c", script],
+                    capture_output=True, text=True, timeout=20)
+                ok = (r.returncode == 0 and "OK" in r.stdout)
+            except (subprocess.SubprocessError, OSError):
+                ok = False
+
+            def _done():
+                btn.set_sensitive(True)
+                self._refresh_network_chip(btn, status_lbl)
+                self._play_bleep()
+                if not ok:
+                    status_lbl.set_text(
+                        status_lbl.get_text()
+                        + "\n⚠ Échec : authentification refusée ou "
+                        "pkexec indisponible.")
+                return False
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_run, daemon=True).start()
 
     def _shortcuts_for(self, conn):
         proto = conn.get("protocol", "rdp")
