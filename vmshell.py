@@ -3990,7 +3990,6 @@ class VMShell(Gtk.Window):
         nav("favorites",  "Favoris", favs)
 
         section("Outils")
-        nav("history",    "Tableau de bord")
         nav("settings",   "Paramètres")
 
         # spacer
