@@ -3195,10 +3195,87 @@ class VMShell(Gtk.Window):
     def _connect(self, conn):
         self._status[conn["id"]] = "connecting"
         self._render_kpis()
+        # Active automatiquement le mode réseau bas-latence à la 1re VM
+        # de la session (un seul prompt pkexec). N'a aucun effet si déjà
+        # actif. Asynchrone pour ne pas retarder l'ouverture de la VM.
+        self._auto_boost_network()
         self._stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT)
         self._stack.set_visible_child_name("console")
         self._console.start(conn)
         self._esc_grab.start()
+
+    def _auto_boost_network(self):
+        """Applique en arrière-plan les optimisations réseau bas-latence.
+        Idempotent : ne fait rien si déjà actif. Tente sans interaction
+        d'abord (sysctl sans sudo échouera, NM powersave demande root) ;
+        si nécessaire, lance pkexec une seule fois par démarrage."""
+        if getattr(self, "_auto_boost_done", False):
+            return
+        self._auto_boost_done = True
+
+        def _worker():
+            try:
+                # 1) Lecture rapide : déjà boosté ? on s'arrête.
+                cc = ""
+                qd = ""
+                try:
+                    with open("/proc/sys/net/ipv4/"
+                              "tcp_congestion_control") as f:
+                        cc = f.read().strip()
+                    with open("/proc/sys/net/core/default_qdisc") as f:
+                        qd = f.read().strip()
+                except OSError:
+                    pass
+                wifi_ps_on = False
+                try:
+                    if shutil.which("iwconfig"):
+                        out = subprocess.check_output(
+                            ["bash", "-c",
+                             "for d in $(nmcli -t -f DEVICE,TYPE d 2>/dev/null"
+                             " | awk -F: '$2==\"wifi\"{print $1}'); do "
+                             "iwconfig $d 2>/dev/null; done"],
+                            text=True, timeout=2,
+                            stderr=subprocess.DEVNULL)
+                        for line in out.splitlines():
+                            if "Power Management" in line and "off" not in line.lower():
+                                wifi_ps_on = True
+                                break
+                except (subprocess.SubprocessError, OSError):
+                    pass
+                if cc == "bbr" and qd == "fq" and not wifi_ps_on:
+                    return  # déjà optimisé.
+
+                # 2) Applique. pkexec --keep-cwd sinon, fallback silencieux.
+                script = r'''
+set +e
+for cn in $(nmcli -t -f NAME,TYPE c show 2>/dev/null \
+        | awk -F: '$2=="802-11-wireless"{print $1}'); do
+    nmcli c modify "$cn" 802-11-wireless.powersave 2 2>/dev/null
+done
+for dev in $(nmcli -t -f DEVICE,TYPE d 2>/dev/null \
+        | awk -F: '$2=="wifi"{print $1}'); do
+    iwconfig "$dev" power off 2>/dev/null
+done
+modprobe tcp_bbr 2>/dev/null
+sysctl -w net.ipv4.tcp_congestion_control=bbr >/dev/null 2>&1
+sysctl -w net.core.default_qdisc=fq           >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_notsent_lowat=16384    >/dev/null 2>&1
+sysctl -w net.ipv4.tcp_low_latency=1          >/dev/null 2>&1
+sysctl -w net.core.netdev_budget=600          >/dev/null 2>&1
+sysctl -w net.core.busy_poll=50               >/dev/null 2>&1
+sysctl -w net.core.busy_read=50               >/dev/null 2>&1
+echo OK
+'''
+                if shutil.which("pkexec"):
+                    subprocess.run(
+                        ["pkexec", "sh", "-c", script],
+                        capture_output=True, text=True, timeout=30)
+                # Petite confirmation discrète dans la console (pas de dialog).
+                print("[vmshell] auto-boost réseau appliqué.", flush=True)
+            except Exception as e:
+                print(f"[vmshell] auto-boost échec : {e}", flush=True)
+
+        threading.Thread(target=_worker, daemon=True).start()
 
     def _on_global_escape(self):
         if self._stack.get_visible_child_name() == "console":
