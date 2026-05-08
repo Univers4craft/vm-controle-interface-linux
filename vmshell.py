@@ -269,6 +269,10 @@ class ClipboardHistory:
         self._items = []          # list[str], plus récent en tête.
         self._last = None
         self._started = False
+        # Callback optionnel appelé (depuis le main loop) à chaque
+        # nouvelle entrée. Utilisé par VMShell pour afficher un toast
+        # « Synchro PP » lorsque la VM copie quelque chose.
+        self.on_change = None
 
     def start(self):
         if self._started:
@@ -294,6 +298,11 @@ class ClipboardHistory:
                 pass
             self._items.insert(0, txt)
             del self._items[self.MAX:]
+            if callable(self.on_change):
+                try:
+                    self.on_change(txt)
+                except Exception:
+                    pass
         return True
 
     def items(self):
@@ -719,6 +728,118 @@ class EscapeGrabber:
 
     def stop(self):
         self._stop = True
+
+
+# ---------------------------------------------------------------------------
+# Global hotkey grabber (Super+V, etc.)
+# ---------------------------------------------------------------------------
+class HotkeyGrabber:
+    """Grab générique de raccourcis globaux via Xlib.
+    Fonctionne aussi quand un client X embarqué (xfreerdp) a le focus
+    clavier — même approche que ``EscapeGrabber``.
+
+    Les modificateurs ``NumLock`` (Mod2) et ``CapsLock`` (Lock) sont
+    automatiquement ignorés en grab + en comparaison."""
+
+    def __init__(self):
+        # Liste des bindings logiques déclarés avant ``start()``.
+        self._raw = []                # list[(keysym_str, modmask, cb)]
+        # Liste des bindings résolus en (keycode, modmask, cb).
+        self._bindings = []
+        self._thread = None
+        self._stop = False
+        self._dpy = None
+
+    def add(self, keysym_str, modmask, callback):
+        """Enregistre un raccourci. ``keysym_str`` au format Xlib
+        (ex. ``"V"``, ``"F12"``). ``modmask`` ex. ``X.Mod4Mask`` pour
+        la touche Super (logo)."""
+        self._raw.append((keysym_str, int(modmask), callback))
+
+    def start(self):
+        if self._thread is not None or not self._raw:
+            return
+        try:
+            from Xlib import display, X, XK
+        except Exception as e:
+            print(f"[vmshell] Xlib indisponible (hotkeys): {e}",
+                  flush=True)
+            return
+        try:
+            self._dpy = display.Display()
+            for ks_name, mods, cb in self._raw:
+                ks = XK.string_to_keysym(ks_name)
+                kc = self._dpy.keysym_to_keycode(ks)
+                if kc == 0:
+                    print(f"[vmshell] hotkey ignoré (keysym inconnu): "
+                          f"{ks_name}", flush=True)
+                    continue
+                self._bindings.append((kc, mods, cb))
+            if not self._bindings:
+                self._dpy = None
+                return
+            self._do_grab()
+            root = self._dpy.screen().root
+            root.change_attributes(event_mask=X.KeyPressMask)
+            self._dpy.sync()
+        except Exception as e:
+            print(f"[vmshell] grab hotkeys échoué: {e}", flush=True)
+            self._dpy = None
+            return
+        print(f"[vmshell] {len(self._bindings)} hotkey(s) global(es) "
+              f"actif(s)", flush=True)
+        self._stop = False
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    def _do_grab(self):
+        from Xlib import X
+        root = self._dpy.screen().root
+        extras = (0, X.Mod2Mask, X.LockMask,
+                  X.Mod2Mask | X.LockMask)
+        for kc, mods, _cb in self._bindings:
+            for ex in extras:
+                try:
+                    root.grab_key(kc, mods | ex, 1,
+                                  X.GrabModeAsync, X.GrabModeAsync)
+                except Exception:
+                    pass
+
+    def regrab(self):
+        if self._dpy is None or not self._bindings:
+            return
+        try:
+            self._do_grab()
+            self._dpy.sync()
+        except Exception:
+            pass
+
+    def _run(self):
+        from Xlib import X
+        ignore_mask = X.Mod2Mask | X.LockMask
+        while not self._stop:
+            try:
+                if self._dpy.pending_events() == 0:
+                    time.sleep(0.05)
+                    continue
+                ev = self._dpy.next_event()
+                if ev.type != X.KeyPress:
+                    continue
+                kc = ev.detail
+                state = ev.state & ~ignore_mask
+                for bkc, bmods, cb in self._bindings:
+                    if bkc == kc and bmods == state:
+                        try:
+                            GLib.idle_add(cb)
+                        except Exception:
+                            pass
+                        break
+            except Exception:
+                time.sleep(0.1)
+
+    def stop(self):
+        self._stop = True
+
 
 # ---------------------------------------------------------------------------
 # Connection model
@@ -3418,6 +3539,27 @@ class VMShell(Gtk.Window):
             CLIP_HISTORY.start()
         except Exception:
             pass
+        # Synchro PP bidirectionnelle : toast + ajout à l'historique
+        # à chaque nouvelle entrée détectée (utile pour confirmer la
+        # synchro RDP +clipboard côté Windows → Linux).
+        try:
+            CLIP_HISTORY.on_change = self._on_clipboard_change
+        except Exception:
+            pass
+
+        # Démarre le hotkey global Super+V dès la 1re mainloop tick.
+        try:
+            GLib.idle_add(self._hk_grab.start)
+        except Exception:
+            pass
+
+        # État de l'animation des cartes (miniatures vivantes).
+        # Les cartes en mode grille s'animent doucement quand AUCUNE
+        # session n'est ouverte. Dès qu'une VM est ouverte, on coupe
+        # le timer pour économiser CPU et batterie.
+        self._anim_phase = 0.0
+        self._anim_thumbs = []   # list[(DrawingArea, conn)]
+        self._anim_timer = None
 
         # Rafraîchit les stats d'usage à la fermeture (catch-all).
         self.connect("destroy", lambda *_: USAGE.end_all())
@@ -3627,6 +3769,17 @@ class VMShell(Gtk.Window):
         # Global Escape grabber: works even when xfreerdp owns the keyboard.
         self._esc_grab = EscapeGrabber(self._on_global_escape)
         self._console._app_esc_regrab = self._esc_grab.regrab
+
+        # Hotkey global Super+V → ouvre l'historique presse-papier
+        # (utilisable depuis n'importe où, même hors session VM).
+        self._hk_grab = HotkeyGrabber()
+        try:
+            from Xlib import X as _X
+            self._hk_grab.add(
+                "V", _X.Mod4Mask, self._on_super_v)
+        except Exception as e:
+            print(f"[vmshell] hotkey Super+V indisponible : {e}",
+                  flush=True)
 
         self._stack.set_visible_child_name("grid")
 
@@ -4121,6 +4274,13 @@ class VMShell(Gtk.Window):
         for c in self._content.get_children():
             self._content.remove(c)
 
+        # Reset des miniatures animées : la liste sera reconstruite
+        # par _build_card pendant le rebuild ci-dessous.
+        try:
+            self._anim_thumbs = []
+        except Exception:
+            pass
+
         items = self._visible_connections()
 
         if self._nav_mode == "settings":
@@ -4167,6 +4327,19 @@ class VMShell(Gtk.Window):
                 self._content.pack_start(self._build_row(conn), False, False, 0)
 
         self._content.show_all()
+        # Démarre/arrête l'animation des miniatures selon le contexte :
+        # uniquement en mode grille, et seulement si aucune session VM
+        # n'est en cours (économie CPU).
+        try:
+            if (self._view_mode == "grid"
+                    and self._nav_mode in ("all", "favorites")
+                    and self._anim_thumbs
+                    and not self._console.has_sessions()):
+                self._start_thumb_animation()
+            else:
+                self._stop_thumb_animation()
+        except Exception:
+            pass
 
     def _render_nav_active(self):
         for k, btn in self._nav_buttons.items():
@@ -4282,6 +4455,20 @@ class VMShell(Gtk.Window):
         meta_user.get_style_context().add_class("vm-meta")
         meta_user.set_ellipsize(Pango.EllipsizeMode.END)
         card.pack_start(meta_user, False, False, 0)
+
+        # Miniature vivante : bandeau animé synthwave qui pulse tant
+        # qu'aucune VM n'est ouverte. Désactivé dès qu'une session est
+        # active (timer arrêté → CPU 0 %).
+        thumb = Gtk.DrawingArea()
+        thumb.set_size_request(-1, 46)
+        thumb.get_style_context().add_class("vm-thumb")
+        thumb.connect("draw",
+                      lambda w, cr, _c=conn: self._draw_thumb(w, cr, _c))
+        try:
+            self._anim_thumbs.append((thumb, conn))
+        except Exception:
+            pass
+        card.pack_start(thumb, False, False, 0)
 
         # status row
         st = self._status.get(conn["id"], "checking")
@@ -4747,6 +4934,12 @@ class VMShell(Gtk.Window):
         self._stack.set_visible_child_name("console")
         self._console.start(conn)
         self._esc_grab.start()
+        # Une VM va être ouverte → coupe l'animation des miniatures
+        # (économie CPU/batterie pendant l'usage VM).
+        try:
+            self._stop_thumb_animation()
+        except Exception:
+            pass
         # Suivi d'usage : on note l'ouverture de la session.
         try:
             USAGE.start(conn)
@@ -4944,6 +5137,154 @@ echo OK
         self._toast_lbl.set_text(msg)
         self._toast_rev.set_reveal_child(True)
         GLib.timeout_add(2200, lambda: (self._toast_rev.set_reveal_child(False), False)[1])
+
+    # ---- Hotkey global Super+V ----------------------------------------
+    def _on_super_v(self):
+        """Ouvre l'historique presse-papier depuis n'importe où.
+        Délègue à ``ConsolePage._open_clip_history_popup`` qui sait gérer
+        l'absence de session (le bouton Coller ne fait rien sans VM,
+        mais Copier dans le PP local fonctionne toujours)."""
+        try:
+            self._console._open_clip_history_popup()
+        except Exception as e:
+            print(f"[vmshell] Super+V handler erreur : {e}", flush=True)
+
+    # ---- Synchro presse-papier bidirectionnelle -----------------------
+    def _on_clipboard_change(self, txt):
+        """Appelé par ClipboardHistory à chaque nouvelle entrée détectée
+        dans le PP local. Comme xfreerdp est lancé avec ``+clipboard``,
+        toute copie côté Windows arrive automatiquement ici via le canal
+        cliprdr → on signale juste la synchro à l'utilisateur."""
+        try:
+            preview = (txt or "").replace("\n", " ⏎ ").strip()
+            if len(preview) > 50:
+                preview = preview[:50] + "…"
+            self._toast(f"📋  Synchro PP : « {preview} »")
+        except Exception:
+            pass
+
+    # ---- Miniatures vivantes (animation des cartes) -------------------
+    def _anim_tick(self):
+        """Pulse l'animation des miniatures de cartes. Tourne uniquement
+        en mode grille et tant qu'aucune session VM n'est ouverte."""
+        try:
+            self._anim_phase = (self._anim_phase + 0.018) % 1.0
+            for area, _conn in list(self._anim_thumbs):
+                try:
+                    if area.get_window() is not None and area.get_mapped():
+                        area.queue_draw()
+                except Exception:
+                    pass
+        except Exception:
+            return False
+        return True
+
+    def _start_thumb_animation(self):
+        """Démarre le timer si pas déjà actif et si pertinent."""
+        try:
+            has_session = (
+                hasattr(self, "_console") and self._console.has_sessions())
+        except Exception:
+            has_session = False
+        if has_session:
+            return
+        if self._anim_timer is not None:
+            return
+        # ~30 fps : assez fluide, peu coûteux.
+        self._anim_timer = GLib.timeout_add(33, self._anim_tick)
+
+    def _stop_thumb_animation(self):
+        """Arrête le timer (CPU économisé en console)."""
+        if self._anim_timer is not None:
+            try:
+                GLib.source_remove(self._anim_timer)
+            except Exception:
+                pass
+            self._anim_timer = None
+
+    def _draw_thumb(self, area, cr, conn):
+        """Rend la miniature animée d'une carte VM.
+        Style synthwave : fond gradient + onde cosinus + 2 pastilles
+        glissantes. La teinte varie selon l'OS de la connexion pour
+        permettre un repérage visuel rapide même en grille de 6+."""
+        try:
+            w = area.get_allocated_width()
+            h = area.get_allocated_height()
+            if w <= 0 or h <= 0:
+                return False
+            phase = self._anim_phase
+            # Hash de la connexion → décalage de phase + teinte légère.
+            cid = conn.get("id", "")
+            seed = (sum(ord(c) for c in cid) % 100) / 100.0
+            local = (phase + seed) % 1.0
+
+            os_name = (conn.get("os") or "").lower()
+            proto = conn.get("protocol", "")
+            if conn.get("maintenance"):
+                base = (0.30, 0.20, 0.10)   # ambré
+            elif os_name == "windows":
+                base = (0.05, 0.18, 0.45)   # bleu Microsoft
+            elif os_name == "linux":
+                base = (0.45, 0.18, 0.05)   # orange Tux
+            elif os_name == "macos":
+                base = (0.20, 0.20, 0.35)   # gris-violet
+            elif proto == "ssh":
+                base = (0.10, 0.30, 0.18)   # vert terminal
+            else:
+                base = (0.18, 0.10, 0.30)
+
+            # Fond dégradé vertical.
+            try:
+                import cairo as _c
+                grad = _c.LinearGradient(0, 0, 0, h)
+                grad.add_color_stop_rgb(0,
+                    base[0] * 0.6, base[1] * 0.6, base[2] * 0.6)
+                grad.add_color_stop_rgb(1,
+                    base[0] * 0.25, base[1] * 0.25, base[2] * 0.25)
+                cr.set_source(grad)
+                cr.rectangle(0, 0, w, h)
+                cr.fill()
+            except Exception:
+                cr.set_source_rgb(*base)
+                cr.rectangle(0, 0, w, h)
+                cr.fill()
+
+            # Onde cosinus mouvante.
+            import math
+            cr.set_line_width(1.6)
+            cr.set_source_rgba(
+                min(1.0, base[0] * 1.8 + 0.2),
+                min(1.0, base[1] * 1.8 + 0.2),
+                min(1.0, base[2] * 1.8 + 0.2),
+                0.55)
+            steps = max(20, int(w / 4))
+            for i in range(steps + 1):
+                x = i * (w / steps)
+                k = (i / steps) * 6.28318 + local * 6.28318
+                y = h * 0.5 + math.sin(k) * (h * 0.18)
+                if i == 0:
+                    cr.move_to(x, y)
+                else:
+                    cr.line_to(x, y)
+            cr.stroke()
+
+            # Deux pastilles glissantes (effet "scan / activité").
+            for off, sz, alpha in ((0.0, 4.5, 0.85),
+                                   (0.5, 3.0, 0.55)):
+                p = (local + off) % 1.0
+                px = p * w
+                py = h * 0.5 + math.sin(p * 6.28318) * (h * 0.22)
+                cr.set_source_rgba(1.0, 1.0, 1.0, alpha)
+                cr.arc(px, py, sz, 0, 6.28318)
+                cr.fill()
+
+            # Petit liseré bas pour cadrer.
+            cr.set_source_rgba(1.0, 1.0, 1.0, 0.10)
+            cr.rectangle(0, h - 1, w, 1)
+            cr.fill()
+        except Exception:
+            pass
+        return False
 
     def _tick_clock(self):
         if hasattr(self, "_clock"):

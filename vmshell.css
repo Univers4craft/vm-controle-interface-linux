@@ -375,3 +375,11 @@ stack { background: transparent; }
   font-weight: 700;
   min-width: 16px;
 }
+
+/* Miniature animée des cartes VM */
+.vm-thumb {
+  border-radius: 8px;
+  margin-top: 4px;
+  margin-bottom: 4px;
+  background: #0b1020;
+}
