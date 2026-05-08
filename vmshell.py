@@ -2009,74 +2009,124 @@ class ConsolePage(Gtk.Box):
             return p.returncode
 
         def _worker():
-            _ui("Installation en cours…", "kpi-warn")
-            install_btn.set_sensitive(False)
+            try:
+                _ui("Installation en cours…", "kpi-warn")
+                install_btn.set_sensitive(False)
 
-            # 1) Pré-requis système (ffmpeg/arecord) si absents.
-            need_apt = []
-            if not shutil.which("ffmpeg"):
-                need_apt.append("ffmpeg")
-            if not shutil.which("arecord"):
-                need_apt.append("alsa-utils")
-            if need_apt:
-                if shutil.which("pkexec") and shutil.which("apt-get"):
-                    _stream(
-                        ["pkexec", "apt-get", "install", "-y"] + need_apt,
-                        f"Installation système : {' '.join(need_apt)}")
-                else:
-                    _log(
-                        f"  ⚠ Installe manuellement : sudo apt install "
-                        f"{' '.join(need_apt)}\n")
+                # 1) Pré-requis système (ffmpeg/arecord) si absents.
+                need_apt = []
+                if not shutil.which("ffmpeg"):
+                    need_apt.append("ffmpeg")
+                if not shutil.which("arecord"):
+                    need_apt.append("alsa-utils")
+                if need_apt:
+                    if shutil.which("pkexec") and shutil.which("apt-get"):
+                        try:
+                            _stream(
+                                ["pkexec", "apt-get", "install", "-y"]
+                                + need_apt,
+                                f"Installation système : "
+                                f"{' '.join(need_apt)}")
+                        except Exception as e:
+                            _log(
+                                f"  ⚠ pkexec apt-get a échoué "
+                                f"(non bloquant) : {e}\n")
+                    else:
+                        _log(
+                            f"  ⚠ Installe manuellement : "
+                            f"sudo apt install {' '.join(need_apt)}\n")
 
-            # 2) pip install openai-whisper.
-            py = shutil.which("python3") or "python3"
-            cmd = [py, "-m", "pip", "install", "--user",
-                   "--upgrade", "openai-whisper"]
-            rc = _stream(cmd, "pip install openai-whisper (--user)")
-            if rc != 0:
-                # Re-essai avec --break-system-packages (PEP 668).
-                _log("\nRetry avec --break-system-packages…\n")
-                rc = _stream(
-                    cmd + ["--break-system-packages"],
-                    "pip install (PEP 668 contourné)")
-
-            # 3) Mise à jour PATH du processus pour que stt_available()
-            #    voie la nouvelle commande sans redémarrage.
-            user_bin = os.path.expanduser("~/.local/bin")
-            if user_bin not in os.environ.get("PATH", "").split(":"):
-                os.environ["PATH"] = (
-                    user_bin + ":" + os.environ.get("PATH", ""))
-                _log(f"\nPATH étendu : {user_bin} ajouté.\n")
-
-            eng = stt_available()
-            if eng:
-                _ui(f"✅ Installé : {eng}", "kpi-good")
-                _log(f"\n✅ Whisper trouvé : {eng}\n"
-                     "Tu peux lancer la dictée (F12).\n")
-
-                def _close_later():
-                    install_btn.set_label("Lancer la dictée")
-                    install_btn.set_sensitive(True)
+                # 2) pip install openai-whisper.
+                py = shutil.which("python3") or "python3"
+                cmd = [py, "-m", "pip", "install", "--user",
+                       "--upgrade", "openai-whisper"]
+                rc = 1
+                try:
+                    rc = _stream(cmd,
+                                 "pip install openai-whisper (--user)")
+                except Exception as e:
+                    _log(f"  ⚠ pip a planté : {e}\n")
+                if rc != 0:
+                    # Re-essai avec --break-system-packages (PEP 668).
+                    _log("\nRetry avec --break-system-packages…\n")
                     try:
-                        install_btn.disconnect_by_func(_on_install)
+                        rc = _stream(
+                            cmd + ["--break-system-packages"],
+                            "pip install (PEP 668 contourné)")
+                    except Exception as e:
+                        _log(f"  ⚠ pip retry a planté : {e}\n")
+
+                # 3) Mise à jour PATH du processus pour que stt_available()
+                #    voie la nouvelle commande sans redémarrage.
+                try:
+                    user_bin = os.path.expanduser("~/.local/bin")
+                    if user_bin not in os.environ.get(
+                            "PATH", "").split(":"):
+                        os.environ["PATH"] = (
+                            user_bin + ":"
+                            + os.environ.get("PATH", ""))
+                        _log(f"\nPATH étendu : {user_bin} ajouté.\n")
+                except Exception:
+                    pass
+
+                eng = None
+                try:
+                    eng = stt_available()
+                except Exception:
+                    pass
+                if eng:
+                    _ui(f"✅ Installé : {eng}", "kpi-good")
+                    _log(f"\n✅ Whisper trouvé : {eng}\n"
+                         "Tu peux lancer la dictée (F12).\n")
+
+                    def _close_later():
+                        try:
+                            install_btn.set_label("Lancer la dictée")
+                            install_btn.set_sensitive(True)
+                            try:
+                                install_btn.disconnect_by_func(
+                                    _on_install)
+                            except Exception:
+                                pass
+                            install_btn.connect(
+                                "clicked",
+                                lambda *_: (
+                                    win.destroy(),
+                                    self._start_dictation_ui()))
+                        except Exception:
+                            pass
+                        return False
+                    GLib.idle_add(_close_later)
+                else:
+                    _ui("✗ Échec de l'installation. "
+                        "Voir le journal.", "kpi-bad")
+                    _log("\n✗ Whisper introuvable après installation.\n"
+                         "Vérifie ta connexion réseau et la sortie "
+                         "ci-dessus.\n")
+
+                    def _retry():
+                        try:
+                            install_btn.set_sensitive(True)
+                        except Exception:
+                            pass
+                        return False
+                    GLib.idle_add(_retry)
+            except Exception as e:
+                # Filet de sécurité ultime : on ne tue jamais l'app.
+                try:
+                    _crash_log(e)
+                except Exception:
+                    pass
+                _ui("✗ Erreur interne. Voir ~/.config/vmshell/crash.log",
+                    "kpi-bad")
+                _log(f"\n✗ Exception interne : {e}\n")
+                def _re():
+                    try:
+                        install_btn.set_sensitive(True)
                     except Exception:
                         pass
-                    install_btn.connect(
-                        "clicked",
-                        lambda *_: (win.destroy(),
-                                    self._start_dictation_ui()))
                     return False
-                GLib.idle_add(_close_later)
-            else:
-                _ui("✗ Échec de l'installation. Voir le journal.",
-                    "kpi-bad")
-                _log("\n✗ Whisper introuvable après installation.\n"
-                     "Vérifie ta connexion réseau et la sortie ci-dessus.\n")
-
-                def _retry():
-                    install_btn.set_sensitive(True)
-                    return False
-                GLib.idle_add(_retry)
+                GLib.idle_add(_re)
 
         def _on_install(*_):
             threading.Thread(target=_worker, daemon=True).start()
@@ -2148,31 +2198,69 @@ class ConsolePage(Gtk.Box):
                 proc["p"].wait(timeout=seconds + 5)
             except (subprocess.SubprocessError, OSError):
                 pass
+            except Exception as e:
+                try:
+                    _crash_log(e)
+                except Exception:
+                    pass
             # Phase transcription.
             def _ts_phase():
-                status.set_text("✍  Transcription…")
-                status.get_style_context().remove_class("kpi-bad")
-                status.get_style_context().add_class("kpi-warn")
+                try:
+                    status.set_text("✍  Transcription…")
+                    status.get_style_context().remove_class("kpi-bad")
+                    status.get_style_context().add_class("kpi-warn")
+                except Exception:
+                    pass
                 return False
             GLib.idle_add(_ts_phase)
-            text = stt_transcribe(wav) or ""
-            text = text.strip()
+            text = ""
+            try:
+                text = (stt_transcribe(wav) or "").strip()
+            except Exception as e:
+                try:
+                    _crash_log(e)
+                except Exception:
+                    pass
 
             def _done():
-                if not text:
-                    status.set_text("⚠  Rien compris (silence ou erreur).")
-                    status.get_style_context().remove_class("kpi-warn")
-                    status.get_style_context().add_class("kpi-bad")
-                else:
-                    status.set_text(f"✅  « {text[:80]} »")
-                    status.get_style_context().remove_class("kpi-warn")
-                    status.get_style_context().add_class("kpi-good")
-                    self._inject_text_into_vm(text)
-                GLib.timeout_add(1800, lambda: (win.destroy(), False)[1])
+                try:
+                    if not text:
+                        status.set_text(
+                            "⚠  Rien compris (silence ou erreur).")
+                        status.get_style_context().remove_class("kpi-warn")
+                        status.get_style_context().add_class("kpi-bad")
+                    else:
+                        status.set_text(f"✅  « {text[:80]} »")
+                        status.get_style_context().remove_class("kpi-warn")
+                        status.get_style_context().add_class("kpi-good")
+                        try:
+                            self._inject_text_into_vm(text)
+                        except Exception as e:
+                            try:
+                                _crash_log(e)
+                            except Exception:
+                                pass
+                    GLib.timeout_add(
+                        1800, lambda: (win.destroy(), False)[1])
+                except Exception:
+                    pass
                 return False
             GLib.idle_add(_done)
 
-        threading.Thread(target=_record, daemon=True).start()
+        try:
+            threading.Thread(target=_record, daemon=True).start()
+        except Exception as e:
+            try:
+                _crash_log(e)
+            except Exception:
+                pass
+            try:
+                self._mini_alert(
+                    "Dictée indisponible",
+                    "Impossible de démarrer le thread "
+                    "d'enregistrement.")
+            except Exception:
+                pass
 
     # -- Masquage écran (panique) ----------------------------------------
     def _panic_mask(self):
@@ -5549,13 +5637,55 @@ def _show_crash_dialog(msg):
 
 
 def main():
-    # Exception hook global : capte tout ce qui ne serait pas pris ailleurs.
+    # Indique si la boucle Gtk a démarré : tant qu'elle n'a pas démarré,
+    # une exception fatale doit afficher le dialog d'erreur et quitter.
+    # Une fois la boucle lancée, on ne veut PLUS jamais quitter sur une
+    # exception : on log + un petit toast, l'utilisateur garde la main.
+    runtime_state = {"running": False}
+
     def _hook(exc_type, exc, tb):
         if issubclass(exc_type, KeyboardInterrupt):
             sys.exit(0)
-        m = _crash_log(exc)
-        _show_crash_dialog(m)
+        try:
+            m = _crash_log(exc)
+        except Exception:
+            m = ""
+        if not runtime_state["running"]:
+            try:
+                _show_crash_dialog(m)
+            except Exception:
+                pass
+        # En runtime : surtout NE PAS quitter ni ouvrir un modal qui
+        # gèlerait l'UI. Le log a été écrit, on continue.
     sys.excepthook = _hook
+
+    # Exceptions levées dans des threads (workers d'installation, dictée,
+    # latence, etc.). Sans ce hook, threading.Thread n'imprime qu'une
+    # trace silencieuse vers stderr.
+    try:
+        def _thook(args):
+            if issubclass(args.exc_type, KeyboardInterrupt):
+                return
+            try:
+                _crash_log(args.exc_value)
+            except Exception:
+                pass
+        threading.excepthook = _thook
+    except Exception:
+        pass
+
+    # Avale les warnings GLib non-critiques (Gtk-WARNING, etc.) plutôt
+    # que de laisser g_log() abort() en cas de fatal_warnings.
+    try:
+        def _glib_log(domain, level, message, _ud=None):
+            try:
+                print(f"[glib:{domain or '?'}] {message}", flush=True)
+            except Exception:
+                pass
+            return False
+        GLib.log_set_default_handler(_glib_log, None)
+    except Exception:
+        pass
 
     try:
         tune_runtime()
@@ -5580,8 +5710,10 @@ def main():
     try:
         win = VMShell()
         win.show_all()
+        runtime_state["running"] = True
         Gtk.main()
     except Exception as e:
+        runtime_state["running"] = False
         m = _crash_log(e)
         _show_crash_dialog(m)
         sys.exit(1)
