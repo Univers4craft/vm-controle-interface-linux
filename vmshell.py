@@ -578,11 +578,33 @@ def speedtest_to(host, port, timeout=4.0):
 # Dictée vocale : enregistrement audio + transcription locale
 # ---------------------------------------------------------------------------
 def stt_available():
-    """Retourne le nom du moteur STT dispo, ou None."""
+    """Retourne le nom (ou chemin) du moteur STT dispo, ou None.
+    Recherche aussi dans ``~/.local/bin`` (où ``pip install --user`` dépose
+    la commande ``whisper`` sans nécessiter un redémarrage de shell)."""
     for cmd in ("whisper-cpp", "whisper.cpp", "whisper", "nerd-dictation"):
-        if shutil.which(cmd):
-            return cmd
+        p = shutil.which(cmd)
+        if p:
+            return p
+    # Fallback : ~/.local/bin n'est pas toujours dans PATH dans une
+    # session lancée par xdg autostart.
+    user_bin = os.path.expanduser("~/.local/bin")
+    for cmd in ("whisper-cpp", "whisper", "nerd-dictation"):
+        p = os.path.join(user_bin, cmd)
+        if os.path.isfile(p) and os.access(p, os.X_OK):
+            return p
     return None
+
+
+def stt_install_check():
+    """Diagnostic rapide pour la fenêtre d'installation. Retourne un dict
+    avec les pré-requis détectés."""
+    return {
+        "pip":     bool(shutil.which("pip3") or shutil.which("pip")),
+        "python":  bool(shutil.which("python3")),
+        "ffmpeg":  bool(shutil.which("ffmpeg")),
+        "arecord": bool(shutil.which("arecord")),
+        "engine":  stt_available(),
+    }
 
 
 def stt_transcribe(wav_path):
@@ -591,8 +613,9 @@ def stt_transcribe(wav_path):
     eng = stt_available()
     if not eng:
         return None
+    eng_name = os.path.basename(eng)
     try:
-        if "whisper-cpp" in eng or "whisper.cpp" in eng:
+        if "whisper-cpp" in eng_name or "whisper.cpp" in eng_name:
             # whisper.cpp : -l fr -nt -np pour sortie texte propre.
             r = subprocess.run(
                 [eng, "-f", wav_path, "-l", "fr", "-nt", "-np",
@@ -603,7 +626,7 @@ def stt_transcribe(wav_path):
                 with open(txt_path) as f:
                     return f.read().strip()
             return (r.stdout or "").strip()
-        if eng == "whisper":
+        if eng_name == "whisper":
             # OpenAI whisper : --model tiny pour rapidité.
             r = subprocess.run(
                 [eng, wav_path, "--language", "French",
@@ -1413,11 +1436,12 @@ class ConsolePage(Gtk.Box):
 
         stt_lbl = ("🎙  Dictée vocale (parle à la VM)"
                    if stt_available()
-                   else "🎙  Dictée vocale (whisper non installé)")
+                   else "🎙  Dictée vocale  ·  📥 Installer Whisper")
         page.pack_start(_mk_tool(
             stt_lbl,
             "Enregistre 6 secondes et tape le texte transcrit "
-            "dans la VM. Nécessite whisper / whisper.cpp.",
+            "dans la VM. Si Whisper n'est pas installé, un "
+            "assistant le télécharge automatiquement.",
             self._start_dictation_ui, kbd="F12"), False, False, 0)
 
         page.pack_start(_mk_tool(
@@ -1870,6 +1894,196 @@ class ConsolePage(Gtk.Box):
         win.show_all()
 
     # -- Dictée vocale ---------------------------------------------------
+    def _install_whisper_ui(self):
+        """Fenêtre d'installation guidée du moteur de dictée Whisper.
+        Lance ``pip install --user openai-whisper`` (avec
+        ``--break-system-packages`` si nécessaire pour Debian/Ubuntu PEP 668)
+        et affiche la sortie en direct. Installe ffmpeg si absent (via
+        pkexec apt). À la fin, ajoute ``~/.local/bin`` au PATH du processus
+        courant pour que la dictée soit utilisable immédiatement."""
+        self._hide_menu()
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Installation de la dictée vocale")
+        win.set_modal(True)
+        win.set_default_size(620, 460)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_start(20); outer.set_margin_end(20)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+
+        title = Gtk.Label(label="🎙  Installer la dictée vocale", xalign=0)
+        title.get_style_context().add_class("section-title")
+        outer.pack_start(title, False, False, 0)
+
+        chk = stt_install_check()
+        intro_lines = [
+            "La dictée utilise <b>OpenAI Whisper</b> (transcription "
+            "100 % locale, hors-ligne, modèle <i>tiny</i> ≈ 75 Mo).",
+            "",
+            f"  • python3 : {'✅' if chk['python']  else '❌'}",
+            f"  • pip      : {'✅' if chk['pip']     else '❌'}",
+            f"  • ffmpeg   : {'✅' if chk['ffmpeg']  else '⚠ sera installé'}",
+            f"  • arecord  : {'✅' if chk['arecord'] else '⚠ sera installé'}",
+        ]
+        intro = Gtk.Label(xalign=0)
+        intro.set_markup("\n".join(intro_lines))
+        intro.set_line_wrap(True)
+        outer.pack_start(intro, False, False, 0)
+
+        # Sortie console défilante.
+        scroll = Gtk.ScrolledWindow()
+        scroll.set_policy(Gtk.PolicyType.AUTOMATIC,
+                          Gtk.PolicyType.AUTOMATIC)
+        scroll.set_vexpand(True)
+        tv = Gtk.TextView()
+        tv.set_editable(False)
+        tv.set_monospace(True)
+        tv.set_wrap_mode(Gtk.WrapMode.WORD_CHAR)
+        tv.get_style_context().add_class("form-sub")
+        buf = tv.get_buffer()
+        scroll.add(tv)
+        outer.pack_start(scroll, True, True, 0)
+
+        status = Gtk.Label(label="Prêt à installer.", xalign=0)
+        status.get_style_context().add_class("form-sub")
+        outer.pack_start(status, False, False, 0)
+
+        btn_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        install_btn = Gtk.Button(label="📥  Installer maintenant")
+        install_btn.get_style_context().add_class("chip")
+        install_btn.get_style_context().add_class("chip-active")
+        cancel_btn = Gtk.Button(label="Plus tard")
+        cancel_btn.get_style_context().add_class("chip")
+        btn_row.pack_start(install_btn, True, True, 0)
+        btn_row.pack_start(cancel_btn,  True, True, 0)
+        outer.pack_start(btn_row, False, False, 0)
+
+        cancel_btn.connect("clicked", lambda *_: win.destroy())
+
+        def _append(line):
+            it = buf.get_end_iter()
+            buf.insert(it, line)
+            # Auto-scroll en bas.
+            mark = buf.create_mark(None, buf.get_end_iter(), False)
+            tv.scroll_to_mark(mark, 0.0, True, 0.0, 1.0)
+
+        def _ui(msg, cls=None):
+            def f():
+                status.set_text(msg)
+                ctx = status.get_style_context()
+                for c in ("kpi-good", "kpi-warn", "kpi-bad"):
+                    ctx.remove_class(c)
+                if cls:
+                    ctx.add_class(cls)
+                return False
+            GLib.idle_add(f)
+
+        def _log(s):
+            GLib.idle_add(lambda: (_append(s), False)[1])
+
+        def _stream(cmd, label):
+            _log(f"\n$ {label}\n  {' '.join(cmd)}\n")
+            try:
+                p = subprocess.Popen(
+                    cmd,
+                    stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                    text=True, bufsize=1)
+            except (OSError, subprocess.SubprocessError) as e:
+                _log(f"  ✗ Impossible de lancer : {e}\n")
+                return 127
+            for line in p.stdout:
+                _log(line)
+            p.wait()
+            _log(f"  → code {p.returncode}\n")
+            return p.returncode
+
+        def _worker():
+            _ui("Installation en cours…", "kpi-warn")
+            install_btn.set_sensitive(False)
+
+            # 1) Pré-requis système (ffmpeg/arecord) si absents.
+            need_apt = []
+            if not shutil.which("ffmpeg"):
+                need_apt.append("ffmpeg")
+            if not shutil.which("arecord"):
+                need_apt.append("alsa-utils")
+            if need_apt:
+                if shutil.which("pkexec") and shutil.which("apt-get"):
+                    _stream(
+                        ["pkexec", "apt-get", "install", "-y"] + need_apt,
+                        f"Installation système : {' '.join(need_apt)}")
+                else:
+                    _log(
+                        f"  ⚠ Installe manuellement : sudo apt install "
+                        f"{' '.join(need_apt)}\n")
+
+            # 2) pip install openai-whisper.
+            py = shutil.which("python3") or "python3"
+            cmd = [py, "-m", "pip", "install", "--user",
+                   "--upgrade", "openai-whisper"]
+            rc = _stream(cmd, "pip install openai-whisper (--user)")
+            if rc != 0:
+                # Re-essai avec --break-system-packages (PEP 668).
+                _log("\nRetry avec --break-system-packages…\n")
+                rc = _stream(
+                    cmd + ["--break-system-packages"],
+                    "pip install (PEP 668 contourné)")
+
+            # 3) Mise à jour PATH du processus pour que stt_available()
+            #    voie la nouvelle commande sans redémarrage.
+            user_bin = os.path.expanduser("~/.local/bin")
+            if user_bin not in os.environ.get("PATH", "").split(":"):
+                os.environ["PATH"] = (
+                    user_bin + ":" + os.environ.get("PATH", ""))
+                _log(f"\nPATH étendu : {user_bin} ajouté.\n")
+
+            eng = stt_available()
+            if eng:
+                _ui(f"✅ Installé : {eng}", "kpi-good")
+                _log(f"\n✅ Whisper trouvé : {eng}\n"
+                     "Tu peux lancer la dictée (F12).\n")
+
+                def _close_later():
+                    install_btn.set_label("Lancer la dictée")
+                    install_btn.set_sensitive(True)
+                    try:
+                        install_btn.disconnect_by_func(_on_install)
+                    except Exception:
+                        pass
+                    install_btn.connect(
+                        "clicked",
+                        lambda *_: (win.destroy(),
+                                    self._start_dictation_ui()))
+                    return False
+                GLib.idle_add(_close_later)
+            else:
+                _ui("✗ Échec de l'installation. Voir le journal.",
+                    "kpi-bad")
+                _log("\n✗ Whisper introuvable après installation.\n"
+                     "Vérifie ta connexion réseau et la sortie ci-dessus.\n")
+
+                def _retry():
+                    install_btn.set_sensitive(True)
+                    return False
+                GLib.idle_add(_retry)
+
+        def _on_install(*_):
+            threading.Thread(target=_worker, daemon=True).start()
+        install_btn.connect("clicked", _on_install)
+
+        win.show_all()
+
     def _start_dictation_ui(self):
         """Enregistre 6 secondes via arecord, transcrit (whisper), tape
         le texte dans la VM. Affiche un compteur en cours d'enregistrement."""
@@ -1882,14 +2096,7 @@ class ConsolePage(Gtk.Box):
                 "Sur Debian/Ubuntu : <tt>sudo apt install alsa-utils</tt>.")
             return
         if not stt_available():
-            self._mini_alert(
-                "Moteur de dictée absent",
-                "Aucun moteur de transcription trouvé.\n\n"
-                "Installe l'un de :\n"
-                "  • <tt>whisper.cpp</tt> (rapide, hors-ligne)\n"
-                "  • <tt>pip install openai-whisper</tt>\n"
-                "  • <tt>nerd-dictation</tt>\n\n"
-                "puis relance la dictée.")
+            self._install_whisper_ui()
             return
         self._hide_menu()
 
