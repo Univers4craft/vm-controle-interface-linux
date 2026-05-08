@@ -349,3 +349,11 @@ stack { background: transparent; }
   border-color: #6366f1;
 }
 .chip-active label { color: #ffffff; }
+
+/* Masquage écran (panique) — fond opaque presque noir */
+.panic-mask {
+  background: #06080d;
+}
+.panic-mask label { color: #cbd5e1; }
+.panic-clock { color: #ffffff; }
+.panic-body  { color: #94a3b8; }

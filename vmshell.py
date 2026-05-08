@@ -94,6 +94,9 @@ CSS_FILE    = APP_DIR / "vmshell.css"
 CONFIG_DIR  = Path(os.path.expanduser("~/.config/vmshell"))
 CONNS_FILE  = CONFIG_DIR / "connections.json"
 SETTINGS_FILE = CONFIG_DIR / "settings.json"
+USAGE_FILE  = CONFIG_DIR / "usage.json"
+AUTOSTART_DIR = Path(os.path.expanduser("~/.config/autostart"))
+AUTOSTART_FILE = AUTOSTART_DIR / "vmshell.desktop"
 
 # ---------------------------------------------------------------------------
 # Helpers
@@ -252,6 +255,372 @@ def thaw_background_apps():
             pass
     print(f"[vmshell] thaw: {len(_FROZEN_PIDS)} processus", flush=True)
     _FROZEN_PIDS.clear()
+
+# ---------------------------------------------------------------------------
+# Historique presse-papier (en mémoire uniquement, max 10 entrées)
+# ---------------------------------------------------------------------------
+class ClipboardHistory:
+    """Garde les N dernières chaînes copiées dans le presse-papier local.
+    Tout reste en RAM : aucune écriture disque pour des raisons de
+    confidentialité (mots de passe, code, etc.)."""
+    MAX = 10
+
+    def __init__(self):
+        self._items = []          # list[str], plus récent en tête.
+        self._last = None
+        self._started = False
+
+    def start(self):
+        if self._started:
+            return
+        self._started = True
+        # On lit le presse-papier toutes les 1.2s. C'est largement assez
+        # rapide pour usage humain et bien plus discret que owner-change.
+        GLib.timeout_add(1200, self._tick)
+
+    def _tick(self):
+        try:
+            clip = Gtk.Clipboard.get(Gdk.SELECTION_CLIPBOARD)
+            txt = clip.wait_for_text()
+        except Exception:
+            return True
+        if txt and txt != self._last:
+            self._last = txt
+            # On dédoublonne : si le texte est déjà dans l'historique on
+            # le remonte en tête au lieu d'en avoir 2 copies.
+            try:
+                self._items.remove(txt)
+            except ValueError:
+                pass
+            self._items.insert(0, txt)
+            del self._items[self.MAX:]
+        return True
+
+    def items(self):
+        return list(self._items)
+
+    def add(self, text):
+        if not text:
+            return
+        try:
+            self._items.remove(text)
+        except ValueError:
+            pass
+        self._items.insert(0, text)
+        del self._items[self.MAX:]
+
+    def clear(self):
+        self._items = []
+        self._last = None
+
+
+# Instance globale (créée par VMShell au démarrage).
+CLIP_HISTORY = ClipboardHistory()
+
+
+# ---------------------------------------------------------------------------
+# Suivi d'usage par VM (durée totale, nb de connexions, dernière utilisation)
+# ---------------------------------------------------------------------------
+class UsageTracker:
+    """Enregistre durée totale, nb de connexions, dernière session par VM.
+    Persisté dans usage.json à chaque fin de session (atomique)."""
+
+    def __init__(self):
+        self._data = load_json(USAGE_FILE, {})
+        self._open = {}   # cid -> (start_ts, name)
+
+    def start(self, conn):
+        self._open[conn["id"]] = (time.time(), conn.get("name", "?"))
+
+    def end(self, cid):
+        info = self._open.pop(cid, None)
+        if not info:
+            return
+        start, name = info
+        elapsed = max(0, int(time.time() - start))
+        rec = self._data.setdefault(cid, {
+            "name": name, "total_sec": 0, "count": 0, "last": 0})
+        rec["name"] = name
+        rec["total_sec"] += elapsed
+        rec["count"] += 1
+        rec["last"] = int(time.time())
+        try:
+            save_json_atomic(USAGE_FILE, self._data)
+        except OSError:
+            pass
+
+    def end_all(self):
+        for cid in list(self._open.keys()):
+            self.end(cid)
+
+    def stats_for(self, cid):
+        return self._data.get(cid, {"total_sec": 0, "count": 0, "last": 0})
+
+    def all_stats(self):
+        return dict(self._data)
+
+    def total_sec(self):
+        return sum(r.get("total_sec", 0) for r in self._data.values())
+
+    def total_count(self):
+        return sum(r.get("count", 0) for r in self._data.values())
+
+
+USAGE = UsageTracker()
+
+
+# ---------------------------------------------------------------------------
+# Auto-démarrage Linux : ~/.config/autostart/vmshell.desktop
+# ---------------------------------------------------------------------------
+def autostart_enabled():
+    return AUTOSTART_FILE.exists()
+
+def autostart_set(enabled: bool):
+    """Active/désactive le lancement de VMShell au login (XDG autostart)."""
+    if enabled:
+        try:
+            AUTOSTART_DIR.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return False
+        exe = sys.executable or "python3"
+        script = str(APP_DIR / "vmshell.py")
+        content = (
+            "[Desktop Entry]\n"
+            "Type=Application\n"
+            "Name=VMShell\n"
+            "Comment=Gestionnaire de connexions distantes\n"
+            f"Exec={exe} {shlex.quote(script)}\n"
+            "Icon=preferences-system-windows\n"
+            "Terminal=false\n"
+            "X-GNOME-Autostart-enabled=true\n"
+            "X-GNOME-Autostart-Delay=3\n"
+        )
+        try:
+            with open(AUTOSTART_FILE, "w", encoding="utf-8") as f:
+                f.write(content)
+            os.chmod(AUTOSTART_FILE, 0o644)
+            return True
+        except OSError:
+            return False
+    else:
+        try:
+            if AUTOSTART_FILE.exists():
+                AUTOSTART_FILE.unlink()
+            return True
+        except OSError:
+            return False
+
+
+# ---------------------------------------------------------------------------
+# Détection multi-écran
+# ---------------------------------------------------------------------------
+def detect_monitors():
+    """Retourne la liste des moniteurs détectés, primaire en tête.
+    Chaque entrée : {name, w, h, primary, x, y}."""
+    out = []
+    try:
+        disp = Gdk.Display.get_default()
+        if disp is None:
+            return out
+        n = disp.get_n_monitors()
+        prim = disp.get_primary_monitor()
+        for i in range(n):
+            m = disp.get_monitor(i)
+            geo = m.get_geometry()
+            try:
+                name = m.get_model() or m.get_manufacturer() or f"Écran {i+1}"
+            except Exception:
+                name = f"Écran {i+1}"
+            out.append({
+                "name": name,
+                "w": geo.width, "h": geo.height,
+                "x": geo.x, "y": geo.y,
+                "primary": (m is prim),
+            })
+        # Primaire en tête.
+        out.sort(key=lambda d: (not d["primary"], d["x"], d["y"]))
+    except Exception:
+        pass
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Estimation autonomie batterie (depuis /sys/class/power_supply)
+# ---------------------------------------------------------------------------
+def estimate_battery_seconds():
+    """Estime le temps restant (s) en se basant sur energy_now / power_now
+    ou charge_now / current_now selon ce que le noyau expose.
+    Retourne (seconds, mode) avec mode = 'discharge'|'charge'|None."""
+    try:
+        base = "/sys/class/power_supply"
+        if not os.path.isdir(base):
+            return None, None
+        for name in sorted(os.listdir(base)):
+            if not name.startswith("BAT"):
+                continue
+            d = os.path.join(base, name)
+
+            def _r(fname):
+                try:
+                    with open(os.path.join(d, fname)) as f:
+                        return int(f.read().strip())
+                except (OSError, ValueError):
+                    return None
+
+            status = ""
+            try:
+                with open(os.path.join(d, "status")) as f:
+                    status = f.read().strip().lower()
+            except OSError:
+                pass
+            if status == "full":
+                return 0, "full"
+
+            # En décharge : energy_now / power_now (Wh/W → h).
+            energy = _r("energy_now")
+            power  = _r("power_now")
+            if energy is not None and power and power > 0:
+                if status.startswith("charg") and not status.startswith("not"):
+                    energy_full = _r("energy_full") or energy
+                    remain = max(0, energy_full - energy)
+                    return int(remain * 3600 / power), "charge"
+                return int(energy * 3600 / power), "discharge"
+
+            # Fallback charge_now / current_now.
+            charge = _r("charge_now")
+            current = _r("current_now")
+            if charge is not None and current and current > 0:
+                if status.startswith("charg") and not status.startswith("not"):
+                    cfull = _r("charge_full") or charge
+                    remain = max(0, cfull - charge)
+                    return int(remain * 3600 / current), "charge"
+                return int(charge * 3600 / current), "discharge"
+    except OSError:
+        pass
+    return None, None
+
+
+def fmt_duration(sec):
+    """3725 → '1h02'  ·  120 → '2 min'."""
+    if sec is None or sec < 0:
+        return "—"
+    if sec < 60:
+        return f"{sec}s"
+    m = sec // 60
+    if m < 60:
+        return f"{m} min"
+    h = m // 60
+    return f"{h}h{m % 60:02d}"
+
+
+# ---------------------------------------------------------------------------
+# Test de débit local → VM (ping + RTT TCP)
+# ---------------------------------------------------------------------------
+def speedtest_to(host, port, timeout=4.0):
+    """Mesure ping (5 paquets ICMP) et latence d'ouverture TCP vers host:port.
+    Retourne dict {ping_avg, ping_loss, tcp_ms, verdict}.
+    Pas de mesure de bande passante (pas d'iperf garanti côté VM)."""
+    out = {"ping_avg": None, "ping_loss": None,
+           "tcp_ms": None, "verdict": "?"}
+    # Ping ICMP.
+    try:
+        p = subprocess.run(
+            ["ping", "-c", "5", "-W", "1", "-q", host],
+            capture_output=True, text=True, timeout=timeout + 6)
+        for line in p.stdout.splitlines():
+            if "packet loss" in line:
+                # ex: "5 packets transmitted, 5 received, 0% packet loss"
+                for tok in line.replace(",", " ").split():
+                    if tok.endswith("%"):
+                        try:
+                            out["ping_loss"] = float(tok[:-1])
+                        except ValueError:
+                            pass
+            if line.startswith("rtt") or line.startswith("round-trip"):
+                # ex: rtt min/avg/max/mdev = 1.2/2.5/4.1/0.7 ms
+                try:
+                    nums = line.split("=")[1].strip().split()[0].split("/")
+                    out["ping_avg"] = float(nums[1])
+                except (IndexError, ValueError):
+                    pass
+    except (subprocess.SubprocessError, OSError):
+        pass
+
+    # Mesure 3× ouverture TCP.
+    samples = []
+    for _ in range(3):
+        t0 = time.time()
+        try:
+            with socket.create_connection((host, int(port)), timeout=timeout):
+                samples.append((time.time() - t0) * 1000.0)
+        except OSError:
+            pass
+    if samples:
+        out["tcp_ms"] = round(sum(samples) / len(samples), 1)
+
+    # Verdict.
+    avg = out["ping_avg"] if out["ping_avg"] is not None else out["tcp_ms"]
+    loss = out["ping_loss"] or 0.0
+    if avg is None:
+        out["verdict"] = "Injoignable"
+    elif loss >= 5 or avg >= 120:
+        out["verdict"] = "Mauvais"
+    elif avg >= 60:
+        out["verdict"] = "Acceptable"
+    elif avg >= 25:
+        out["verdict"] = "Bon"
+    else:
+        out["verdict"] = "Excellent"
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Dictée vocale : enregistrement audio + transcription locale
+# ---------------------------------------------------------------------------
+def stt_available():
+    """Retourne le nom du moteur STT dispo, ou None."""
+    for cmd in ("whisper-cpp", "whisper.cpp", "whisper", "nerd-dictation"):
+        if shutil.which(cmd):
+            return cmd
+    return None
+
+
+def stt_transcribe(wav_path):
+    """Tente de transcrire un fichier WAV en français. Retourne le texte
+    ou None si aucun moteur dispo / erreur."""
+    eng = stt_available()
+    if not eng:
+        return None
+    try:
+        if "whisper-cpp" in eng or "whisper.cpp" in eng:
+            # whisper.cpp : -l fr -nt -np pour sortie texte propre.
+            r = subprocess.run(
+                [eng, "-f", wav_path, "-l", "fr", "-nt", "-np",
+                 "-otxt", "-of", wav_path],
+                capture_output=True, text=True, timeout=120)
+            txt_path = wav_path + ".txt"
+            if os.path.isfile(txt_path):
+                with open(txt_path) as f:
+                    return f.read().strip()
+            return (r.stdout or "").strip()
+        if eng == "whisper":
+            # OpenAI whisper : --model tiny pour rapidité.
+            r = subprocess.run(
+                [eng, wav_path, "--language", "French",
+                 "--model", "tiny", "--output_format", "txt",
+                 "--output_dir", os.path.dirname(wav_path) or "."],
+                capture_output=True, text=True, timeout=180)
+            base = os.path.splitext(os.path.basename(wav_path))[0]
+            txt_path = os.path.join(
+                os.path.dirname(wav_path) or ".", base + ".txt")
+            if os.path.isfile(txt_path):
+                with open(txt_path) as f:
+                    return f.read().strip()
+            return (r.stdout or "").strip()
+    except (subprocess.SubprocessError, OSError):
+        pass
+    return None
+
 
 # ---------------------------------------------------------------------------
 # Global Escape grabber
@@ -571,6 +940,10 @@ class ConsolePage(Gtk.Box):
             try: s.proc.terminate()
             except OSError: pass
         log_session("end", s.conn)
+        try:
+            USAGE.end(s.conn.get("id"))
+        except Exception:
+            pass
         if s in self._sessions:
             self._sessions.remove(s)
         # Retire la box du Stack si elle y est encore.
@@ -600,6 +973,10 @@ class ConsolePage(Gtk.Box):
                 try: s.proc.terminate()
                 except OSError: pass
             log_session("end", s.conn)
+            try:
+                USAGE.end(s.conn.get("id"))
+            except Exception:
+                pass
         self._sessions.clear()
         self._current = None
         for child in self._stage.get_children():
@@ -881,6 +1258,64 @@ class ConsolePage(Gtk.Box):
         host_btn.connect("clicked", lambda *_: self._open_host_panel())
         self._menu_box.pack_start(host_btn, False, False, 0)
 
+        # ---- OUTILS DE SESSION -----------------------------------------
+        if self._current is not None:
+            sep_o = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+            sep_o.set_margin_top(6); sep_o.set_margin_bottom(6)
+            self._menu_box.pack_start(sep_o, False, False, 0)
+            hdr_o = Gtk.Label(label="OUTILS DE SESSION", xalign=0)
+            hdr_o.get_style_context().add_class("nav-section")
+            self._menu_box.pack_start(hdr_o, False, False, 0)
+
+            def _mk_tool(label, tip, cb, kbd=None):
+                b = Gtk.Button()
+                b.get_style_context().add_class("menu-item")
+                row = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+                lbl = Gtk.Label(label=label, xalign=0)
+                lbl.set_hexpand(True)
+                row.pack_start(lbl, True, True, 0)
+                if kbd:
+                    k = Gtk.Label(label=kbd)
+                    k.get_style_context().add_class("kbd")
+                    row.pack_end(k, False, False, 0)
+                b.add(row)
+                b.set_tooltip_text(tip)
+                b.connect("clicked", lambda *_: cb())
+                return b
+
+            # Historique presse-papier (10 derniers).
+            self._menu_box.pack_start(_mk_tool(
+                f"📚  Historique presse-papier  "
+                f"({len(CLIP_HISTORY.items())})",
+                "Affiche les 10 derniers textes que tu as copiés "
+                "et te permet de les recoller dans la VM.",
+                self._open_clip_history_popup), False, False, 0)
+
+            # Test de débit.
+            self._menu_box.pack_start(_mk_tool(
+                "🚀  Tester ma connexion vers cette VM",
+                "Mesure ping ICMP + latence TCP, donne un verdict "
+                "(Excellent / Bon / Acceptable / Mauvais).",
+                self._open_speedtest_popup), False, False, 0)
+
+            # Dictée vocale.
+            stt_lbl = ("🎙  Dictée vocale (parle à la VM)"
+                       if stt_available()
+                       else "🎙  Dictée vocale (whisper non installé)")
+            self._menu_box.pack_start(_mk_tool(
+                stt_lbl,
+                "Enregistre 6 secondes de dictée et tape le texte "
+                "transcrit dans la VM. Nécessite whisper / whisper.cpp.",
+                self._start_dictation_ui, kbd="F12"), False, False, 0)
+
+            # Masquage écran (panique).
+            self._menu_box.pack_start(_mk_tool(
+                "🛡  Masquer l'écran (quelqu'un arrive)",
+                "Couvre instantanément toutes les VM avec un fond "
+                "neutre. Cliquer pour reprendre.",
+                self._panic_mask, kbd="Ctrl  Shift  H"), False, False, 0)
+
         # ---- MODE DE PERFORMANCE ----
         hdr_p = Gtk.Label(label="MODE DE PERFORMANCE", xalign=0)
         hdr_p.get_style_context().add_class("nav-section")
@@ -1132,6 +1567,394 @@ class ConsolePage(Gtk.Box):
             return False
         GLib.timeout_add(180, _do_type)
 
+    def _inject_text_into_vm(self, text):
+        """Tape le texte donné dans la VM courante (SSH ou RDP).
+        Utilisé par l'historique presse-papier et la dictée vocale."""
+        if not text:
+            return
+        s = self._current
+        if s is None:
+            return
+        self._hide_menu()
+        if s.conn.get("protocol") == "ssh" and s.vte is not None:
+            try:
+                s.vte.feed_child(text.encode("utf-8"))
+            except Exception:
+                pass
+            return
+        if not shutil.which("xdotool"):
+            return
+        def _do_type():
+            try:
+                subprocess.Popen(
+                    ["xdotool", "type", "--delay", "8", "--", text])
+            except OSError:
+                pass
+            return False
+        GLib.timeout_add(180, _do_type)
+
+    # -- Historique presse-papier ----------------------------------------
+    def _open_clip_history_popup(self):
+        """Affiche les 10 dernières chaînes copiées avec un bouton
+        "Coller" par entrée. Tout reste en RAM."""
+        self._hide_menu()
+        items = CLIP_HISTORY.items()
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Historique presse-papier")
+        win.set_modal(True)
+        win.set_default_size(620, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_start(18); outer.set_margin_end(18)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+
+        title = Gtk.Label(label="📚  Historique presse-papier", xalign=0)
+        title.get_style_context().add_class("section-title")
+        outer.pack_start(title, False, False, 0)
+        sub = Gtk.Label(
+            label="Les 10 derniers textes copiés (gardés en RAM uniquement).",
+            xalign=0)
+        sub.get_style_context().add_class("form-sub")
+        outer.pack_start(sub, False, False, 0)
+
+        if not items:
+            empty = Gtk.Label(
+                label="\nAucun texte copié pour l'instant.\n"
+                      "Copie quelque chose (Ctrl+C) puis reviens ici.",
+                xalign=0)
+            empty.get_style_context().add_class("form-sub")
+            outer.pack_start(empty, False, False, 0)
+        else:
+            scroller = Gtk.ScrolledWindow()
+            scroller.set_policy(
+                Gtk.PolicyType.NEVER, Gtk.PolicyType.AUTOMATIC)
+            scroller.set_size_request(-1, min(420, 70 * len(items)))
+            lst = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=6)
+            for idx, txt in enumerate(items):
+                row = Gtk.Box(
+                    orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+                # Aperçu : 1ère ligne tronquée à ~80 chars.
+                preview = txt.replace("\n", " ⏎ ").strip()
+                if len(preview) > 90:
+                    preview = preview[:90] + "…"
+                lbl = Gtk.Label(label=f"{idx+1:>2}. {preview}", xalign=0)
+                lbl.set_hexpand(True)
+                lbl.set_ellipsize(Pango.EllipsizeMode.END)
+                lbl.set_tooltip_text(txt[:500])
+                row.pack_start(lbl, True, True, 0)
+                paste_btn = Gtk.Button(label="📋  Coller")
+                paste_btn.get_style_context().add_class("chip")
+                paste_btn.get_style_context().add_class("chip-primary")
+                paste_btn.connect(
+                    "clicked",
+                    lambda _w, _t=txt, _win=win:
+                        (_win.destroy(), self._inject_text_into_vm(_t)))
+                row.pack_end(paste_btn, False, False, 0)
+                copy_btn = Gtk.Button(label="⧉")
+                copy_btn.get_style_context().add_class("chip-icon")
+                copy_btn.set_tooltip_text(
+                    "Recopier dans le presse-papier local")
+                def _do_copy(_w, _t=txt):
+                    Gtk.Clipboard.get(
+                        Gdk.SELECTION_CLIPBOARD).set_text(_t, -1)
+                copy_btn.connect("clicked", _do_copy)
+                row.pack_end(copy_btn, False, False, 0)
+                lst.pack_start(row, False, False, 0)
+            scroller.add(lst)
+            outer.pack_start(scroller, True, True, 0)
+
+        # Actions globales.
+        actions = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        clear_btn = Gtk.Button(label="🗑  Vider l'historique")
+        clear_btn.get_style_context().add_class("chip")
+        clear_btn.get_style_context().add_class("chip-danger")
+        clear_btn.connect(
+            "clicked",
+            lambda *_: (CLIP_HISTORY.clear(), win.destroy()))
+        close_btn = Gtk.Button(label="Fermer")
+        close_btn.get_style_context().add_class("chip")
+        close_btn.connect("clicked", lambda *_: win.destroy())
+        actions.pack_start(clear_btn, False, False, 0)
+        actions.pack_end(close_btn, False, False, 0)
+        outer.pack_start(actions, False, False, 6)
+
+        win.show_all()
+
+    # -- Test de débit ---------------------------------------------------
+    def _open_speedtest_popup(self):
+        """Lance ping + 3× TCP vers la VM courante et affiche un verdict."""
+        s = self._current
+        if s is None:
+            return
+        self._hide_menu()
+        conn = s.conn
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Test de connexion")
+        win.set_modal(True)
+        win.set_default_size(520, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_start(18); outer.set_margin_end(18)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+
+        title = Gtk.Label(label="🚀  Test de connexion", xalign=0)
+        title.get_style_context().add_class("section-title")
+        outer.pack_start(title, False, False, 0)
+        sub = Gtk.Label(
+            label=f"Cible : {conn.get('host')}:{conn.get('port')}  ·  "
+                  f"{conn.get('name', '')}", xalign=0)
+        sub.get_style_context().add_class("form-sub")
+        outer.pack_start(sub, False, False, 0)
+
+        running = Gtk.Label(
+            label="\n⏳  Mesure en cours…  (5 paquets ICMP + 3× TCP)",
+            xalign=0)
+        running.get_style_context().add_class("form-sub")
+        outer.pack_start(running, False, False, 0)
+
+        result = Gtk.Label(xalign=0)
+        result.set_line_wrap(True)
+        outer.pack_start(result, False, False, 0)
+
+        close_btn = Gtk.Button(label="Fermer")
+        close_btn.get_style_context().add_class("chip")
+        close_btn.set_sensitive(False)
+        close_btn.connect("clicked", lambda *_: win.destroy())
+        outer.pack_start(close_btn, False, False, 6)
+
+        def _worker():
+            r = speedtest_to(conn["host"], conn["port"])
+            def _show():
+                running.set_text("")
+                ping = (f"{r['ping_avg']:.1f} ms"
+                        if r['ping_avg'] is not None else "—")
+                loss = (f"{r['ping_loss']:.0f} %"
+                        if r['ping_loss'] is not None else "—")
+                tcp  = (f"{r['tcp_ms']} ms"
+                        if r['tcp_ms']  is not None else "—")
+                cls = {"Excellent": "kpi-good",
+                       "Bon":       "kpi-good",
+                       "Acceptable": "kpi-warn",
+                       "Mauvais":   "kpi-bad",
+                       "Injoignable": "kpi-bad"}.get(r["verdict"], None)
+                msg = (f"\n<b>Verdict : {r['verdict']}</b>\n\n"
+                       f"• Ping moyen : <b>{ping}</b>\n"
+                       f"• Perte paquets : <b>{loss}</b>\n"
+                       f"• Latence TCP : <b>{tcp}</b>")
+                result.set_markup(msg)
+                if cls:
+                    result.get_style_context().add_class(cls)
+                close_btn.set_sensitive(True)
+                return False
+            GLib.idle_add(_show)
+
+        threading.Thread(target=_worker, daemon=True).start()
+        win.show_all()
+
+    # -- Dictée vocale ---------------------------------------------------
+    def _start_dictation_ui(self):
+        """Enregistre 6 secondes via arecord, transcrit (whisper), tape
+        le texte dans la VM. Affiche un compteur en cours d'enregistrement."""
+        if self._current is None:
+            return
+        if not shutil.which("arecord"):
+            self._mini_alert(
+                "Dictée indisponible",
+                "Le binaire <b>arecord</b> n'est pas installé.\n"
+                "Sur Debian/Ubuntu : <tt>sudo apt install alsa-utils</tt>.")
+            return
+        if not stt_available():
+            self._mini_alert(
+                "Moteur de dictée absent",
+                "Aucun moteur de transcription trouvé.\n\n"
+                "Installe l'un de :\n"
+                "  • <tt>whisper.cpp</tt> (rapide, hors-ligne)\n"
+                "  • <tt>pip install openai-whisper</tt>\n"
+                "  • <tt>nerd-dictation</tt>\n\n"
+                "puis relance la dictée.")
+            return
+        self._hide_menu()
+
+        wav = "/tmp/vmshell_dictation.wav"
+        seconds = 6
+
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Dictée vocale")
+        win.set_modal(True)
+        win.set_default_size(420, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_start(20); outer.set_margin_end(20)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+        title = Gtk.Label(label="🎙  Dictée vocale", xalign=0)
+        title.get_style_context().add_class("section-title")
+        outer.pack_start(title, False, False, 0)
+        info = Gtk.Label(
+            label=f"Parle clairement pendant {seconds}s, "
+                  "puis le texte sera tapé dans la VM.",
+            xalign=0)
+        info.set_line_wrap(True)
+        info.get_style_context().add_class("form-sub")
+        outer.pack_start(info, False, False, 0)
+        status = Gtk.Label(label="🔴  Enregistrement…", xalign=0)
+        status.get_style_context().add_class("kpi-bad")
+        outer.pack_start(status, False, False, 0)
+        win.show_all()
+
+        proc = {"p": None}
+
+        def _record():
+            try:
+                # arecord 16 kHz mono 16 bits → format compatible whisper.
+                proc["p"] = subprocess.Popen(
+                    ["arecord", "-q", "-f", "S16_LE",
+                     "-r", "16000", "-c", "1",
+                     "-d", str(seconds), wav],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                proc["p"].wait(timeout=seconds + 5)
+            except (subprocess.SubprocessError, OSError):
+                pass
+            # Phase transcription.
+            def _ts_phase():
+                status.set_text("✍  Transcription…")
+                status.get_style_context().remove_class("kpi-bad")
+                status.get_style_context().add_class("kpi-warn")
+                return False
+            GLib.idle_add(_ts_phase)
+            text = stt_transcribe(wav) or ""
+            text = text.strip()
+
+            def _done():
+                if not text:
+                    status.set_text("⚠  Rien compris (silence ou erreur).")
+                    status.get_style_context().remove_class("kpi-warn")
+                    status.get_style_context().add_class("kpi-bad")
+                else:
+                    status.set_text(f"✅  « {text[:80]} »")
+                    status.get_style_context().remove_class("kpi-warn")
+                    status.get_style_context().add_class("kpi-good")
+                    self._inject_text_into_vm(text)
+                GLib.timeout_add(1800, lambda: (win.destroy(), False)[1])
+                return False
+            GLib.idle_add(_done)
+
+        threading.Thread(target=_record, daemon=True).start()
+
+    # -- Masquage écran (panique) ----------------------------------------
+    def _panic_mask(self):
+        """Couvre toute la fenêtre principale d'un overlay opaque pour
+        masquer la VM jusqu'au clic. Idéal quand quelqu'un arrive."""
+        self._hide_menu()
+        top = self.get_toplevel()
+        if not isinstance(top, Gtk.Window):
+            return
+        # Fenêtre fullscreen au-dessus de tout, opaque.
+        mask = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        mask.set_decorated(False)
+        mask.set_modal(True)
+        mask.set_keep_above(True)
+        mask.set_skip_taskbar_hint(True)
+        try:
+            mask.set_transient_for(top)
+        except Exception:
+            pass
+        mask.fullscreen()
+        mask.get_style_context().add_class("panic-mask")
+
+        ev = Gtk.EventBox()
+        mask.add(ev)
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        box.set_valign(Gtk.Align.CENTER)
+        box.set_halign(Gtk.Align.CENTER)
+        ev.add(box)
+
+        clock = Gtk.Label(xalign=0.5)
+        clock.get_style_context().add_class("panic-clock")
+        body = Gtk.Label(xalign=0.5)
+        body.get_style_context().add_class("panic-body")
+        body.set_markup(
+            "<span size='xx-large' weight='bold'>VMShell</span>\n"
+            "<span size='large' alpha='75%'>"
+            "Cliquez n'importe où pour reprendre.</span>")
+        box.pack_start(clock, False, False, 0)
+        box.pack_start(body, False, False, 0)
+
+        def _tick():
+            if not mask.get_visible():
+                return False
+            now = datetime.now()
+            clock.set_markup(
+                f"<span size='100000' weight='bold'>"
+                f"{now.strftime('%H:%M')}</span>")
+            return True
+        _tick()
+        GLib.timeout_add_seconds(10, _tick)
+
+        ev.connect("button-press-event", lambda *_: (mask.destroy(), True)[1])
+        mask.connect("key-press-event",  lambda *_: (mask.destroy(), True)[1])
+        mask.show_all()
+        mask.present()
+
+    def _mini_alert(self, title, msg_markup):
+        """Petit popup d'info utilitaire."""
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title(title); win.set_modal(True)
+        win.set_default_size(440, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=10)
+        outer.set_margin_start(20); outer.set_margin_end(20)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+        t = Gtk.Label(xalign=0)
+        t.set_markup(f"<b>{title}</b>")
+        t.get_style_context().add_class("section-title")
+        outer.pack_start(t, False, False, 0)
+        body = Gtk.Label(xalign=0)
+        body.set_line_wrap(True)
+        body.set_markup(msg_markup)
+        outer.pack_start(body, False, False, 0)
+        b = Gtk.Button(label="OK")
+        b.get_style_context().add_class("chip")
+        b.connect("clicked", lambda *_: win.destroy())
+        outer.pack_start(b, False, False, 6)
+        win.show_all()
+
     # -- Panneau "PC HÔTE" ------------------------------------------------
     def _open_host_panel(self):
         """Popup avec les paramètres réels de l'ordinateur local :
@@ -1173,6 +1996,7 @@ class ConsolePage(Gtk.Box):
         bat_hdr.get_style_context().add_class("nav-section")
         bat_box.pack_start(bat_hdr, False, False, 0)
         bat_bar = None
+        bat_eta_lbl = None
         if bat_pct is None:
             bat_lbl = Gtk.Label(label="Aucune batterie détectée.", xalign=0)
             bat_lbl.get_style_context().add_class("form-sub")
@@ -1182,7 +2006,40 @@ class ConsolePage(Gtk.Box):
             bat_bar.set_show_text(True)
             self._refresh_bat_bar(bat_bar)
             bat_box.pack_start(bat_bar, False, False, 0)
+            # Estimation d'autonomie restante.
+            bat_eta_lbl = Gtk.Label(xalign=0)
+            bat_eta_lbl.get_style_context().add_class("form-sub")
+            self._refresh_bat_eta(bat_eta_lbl)
+            bat_box.pack_start(bat_eta_lbl, False, False, 0)
         outer.pack_start(bat_box, False, False, 0)
+
+        # ---- ÉCRANS DÉTECTÉS -------------------------------------------
+        try:
+            mons = detect_monitors()
+        except Exception:
+            mons = []
+        if mons:
+            scr_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            scr_hdr = Gtk.Label(
+                label=f"🖥  Écrans détectés  ({len(mons)})", xalign=0)
+            scr_hdr.get_style_context().add_class("nav-section")
+            scr_box.pack_start(scr_hdr, False, False, 0)
+            for i, m in enumerate(mons, 1):
+                star = "★ " if m["primary"] else "   "
+                line = Gtk.Label(
+                    label=f"{star}Écran {i}  ·  "
+                          f"{m['w']}×{m['h']}  ·  {m['name']}"
+                          + ("  (principal)" if m["primary"] else ""),
+                    xalign=0)
+                line.get_style_context().add_class("form-sub")
+                scr_box.pack_start(line, False, False, 0)
+            if len(mons) >= 2:
+                tip = Gtk.Label(
+                    label="La VM s'affiche sur l'écran principal "
+                          "(intégration GTK).", xalign=0)
+                tip.get_style_context().add_class("form-sub")
+                scr_box.pack_start(tip, False, False, 0)
+            outer.pack_start(scr_box, False, False, 0)
 
         # ---- MODE ÉNERGIE ----------------------------------------------
         cur_profile, profiles = self._read_power_profile()
@@ -1322,6 +2179,8 @@ class ConsolePage(Gtk.Box):
                 return False
             if bat_bar is not None:
                 self._refresh_bat_bar(bat_bar)
+            if bat_eta_lbl is not None:
+                self._refresh_bat_eta(bat_eta_lbl)
             if live_lbl is not None:
                 self._refresh_live_cpu(live_lbl)
             return True
@@ -1343,6 +2202,29 @@ class ConsolePage(Gtk.Box):
         else:
             icon = "🔋"
         bar.set_text(f"{icon}  {pct}%  ·  {status or 'inconnu'}")
+
+    def _refresh_bat_eta(self, label):
+        """Affiche l'estimation d'autonomie dans `label`."""
+        sec, mode = estimate_battery_seconds()
+        if sec is None:
+            label.set_text("⏱  Estimation indisponible")
+            return
+        if mode == "full":
+            label.set_text("🔌  Batterie pleine")
+            return
+        if mode == "charge":
+            label.set_text(f"⚡  Recharge complète dans ~{fmt_duration(sec)}")
+            return
+        # Discharge : warn ≤ 60min.
+        txt = f"⏱  ~{fmt_duration(sec)} restantes à la consommation actuelle"
+        label.set_text(txt)
+        ctx = label.get_style_context()
+        for c in ("kpi-good", "kpi-warn", "kpi-bad"):
+            ctx.remove_class(c)
+        if sec <= 30 * 60:
+            ctx.add_class("kpi-bad")
+        elif sec <= 60 * 60:
+            ctx.add_class("kpi-warn")
 
     def _refresh_live_cpu(self, label):
         # Fréquence moyenne + EPP du CPU0 = preuve que le mode est actif.
@@ -1860,6 +2742,19 @@ echo OK
                    "/smartcard",
                    "/auto-reconnect",
                    "/auto-reconnect-max-retries:5"]
+            # Multi-écran intelligent : on détecte le nombre d'écrans
+            # uniquement pour log et indication dans le panneau "Mon PC".
+            # On ne passe pas /multimon à xfreerdp : il est incompatible
+            # avec /parent-window (qu'on utilise pour intégrer la VM dans
+            # la fenêtre VMShell). L'embedding force tout sur 1 écran.
+            try:
+                mons = detect_monitors()
+                if len(mons) >= 2:
+                    print(
+                        f"[vmshell] {len(mons)} moniteurs détectés "
+                        f"(VM affichée sur le primaire).", flush=True)
+            except Exception:
+                pass
             if profile == "gamer":
                 hw_ok = bool(HW_INFO.get("gpu_accel"))
                 if hw_ok:
@@ -1973,21 +2868,82 @@ echo OK
 import math  # noqa: E402
 
 class AnimatedBackground(Gtk.DrawingArea):
-    """Static colorful gradient background (no animation, no CPU cost)."""
+    """Fond dégradé qui change subtilement selon l'heure :
+    nuit (bleu/violet froid), aube (rose/ambre), jour (turquoise/bleu),
+    crépuscule (orange/violet). Aucun coût CPU continu : on
+    ne redessine que toutes les 5 minutes."""
 
-    BLOBS = [
-        # (color rgb, x_ratio, y_ratio, radius_ratio, alpha_peak)
-        ((0.22, 0.27, 0.55), 0.15, 0.20, 0.55, 0.55),  # deep blue
-        ((0.36, 0.22, 0.55), 0.85, 0.18, 0.50, 0.50),  # deep violet
-        ((0.50, 0.18, 0.38), 0.78, 0.85, 0.50, 0.45),  # muted plum
-        ((0.10, 0.40, 0.40), 0.18, 0.85, 0.55, 0.45),  # muted teal
-        ((0.45, 0.30, 0.18), 0.55, 0.55, 0.40, 0.30),  # warm amber-brown
-    ]
+    # Cinq palettes par tranche horaire. Chaque palette est une liste de
+    # blobs (rgb, x, y, radius, alpha_peak).
+    PALETTES = {
+        "night": [   # 23h-5h : froid, profond, étoilé
+            ((0.10, 0.13, 0.30), 0.15, 0.22, 0.55, 0.55),
+            ((0.18, 0.12, 0.42), 0.85, 0.18, 0.50, 0.50),
+            ((0.30, 0.10, 0.42), 0.78, 0.85, 0.48, 0.42),
+            ((0.05, 0.18, 0.32), 0.18, 0.85, 0.55, 0.45),
+            ((0.16, 0.14, 0.30), 0.55, 0.55, 0.40, 0.30),
+        ],
+        "dawn": [    # 5h-9h : rose / ambre, doux
+            ((0.55, 0.35, 0.45), 0.18, 0.20, 0.55, 0.55),
+            ((0.65, 0.42, 0.30), 0.82, 0.22, 0.50, 0.50),
+            ((0.40, 0.25, 0.40), 0.75, 0.82, 0.50, 0.45),
+            ((0.55, 0.40, 0.35), 0.20, 0.82, 0.52, 0.45),
+            ((0.50, 0.35, 0.30), 0.55, 0.55, 0.40, 0.30),
+        ],
+        "day": [     # 9h-17h : turquoise / bleu vif, énergique
+            ((0.18, 0.40, 0.62), 0.15, 0.22, 0.55, 0.55),
+            ((0.22, 0.50, 0.55), 0.85, 0.18, 0.50, 0.50),
+            ((0.30, 0.45, 0.65), 0.78, 0.85, 0.48, 0.45),
+            ((0.10, 0.42, 0.50), 0.18, 0.85, 0.55, 0.45),
+            ((0.25, 0.40, 0.55), 0.55, 0.55, 0.40, 0.30),
+        ],
+        "dusk": [    # 17h-20h : orange / violet, chaleureux
+            ((0.60, 0.30, 0.20), 0.18, 0.22, 0.55, 0.55),
+            ((0.45, 0.20, 0.42), 0.82, 0.22, 0.50, 0.50),
+            ((0.50, 0.25, 0.30), 0.75, 0.82, 0.50, 0.45),
+            ((0.55, 0.35, 0.22), 0.20, 0.82, 0.52, 0.45),
+            ((0.40, 0.22, 0.32), 0.55, 0.55, 0.40, 0.30),
+        ],
+        "evening": [ # 20h-23h : violet / bleu nuit, calme
+            ((0.22, 0.27, 0.55), 0.15, 0.20, 0.55, 0.55),
+            ((0.36, 0.22, 0.55), 0.85, 0.18, 0.50, 0.50),
+            ((0.50, 0.18, 0.38), 0.78, 0.85, 0.50, 0.45),
+            ((0.10, 0.20, 0.38), 0.18, 0.85, 0.55, 0.45),
+            ((0.30, 0.20, 0.32), 0.55, 0.55, 0.40, 0.30),
+        ],
+    }
+    # Bandes de fond (3 stops du gradient) par tranche.
+    BANDS = {
+        "night":   ((0.04, 0.05, 0.10), (0.06, 0.06, 0.13), (0.08, 0.05, 0.15)),
+        "dawn":    ((0.18, 0.10, 0.14), (0.22, 0.13, 0.18), (0.26, 0.16, 0.18)),
+        "day":     ((0.06, 0.10, 0.16), (0.08, 0.13, 0.20), (0.10, 0.16, 0.22)),
+        "dusk":    ((0.18, 0.10, 0.10), (0.22, 0.12, 0.14), (0.24, 0.14, 0.18)),
+        "evening": ((0.078, 0.090, 0.137), (0.106, 0.106, 0.165),
+                    (0.137, 0.094, 0.180)),
+    }
+
+    @staticmethod
+    def _slot_for_hour(h):
+        if 5  <= h < 9:  return "dawn"
+        if 9  <= h < 17: return "day"
+        if 17 <= h < 20: return "dusk"
+        if 20 <= h < 23: return "evening"
+        return "night"
 
     def __init__(self):
         super().__init__()
         self.set_hexpand(True); self.set_vexpand(True)
+        self._slot = self._slot_for_hour(datetime.now().hour)
         self.connect("draw", self._on_draw)
+        # Re-check toutes les 5 min. Pas plus pour rester gratuit.
+        GLib.timeout_add_seconds(300, self._recheck_slot)
+
+    def _recheck_slot(self):
+        new_slot = self._slot_for_hour(datetime.now().hour)
+        if new_slot != self._slot:
+            self._slot = new_slot
+            self.queue_draw()
+        return True
 
     def _on_draw(self, _w, cr):
         a = self.get_allocation()
@@ -1996,16 +2952,18 @@ class AnimatedBackground(Gtk.DrawingArea):
             return False
         try:
             import cairo
+            blobs = self.PALETTES.get(self._slot, self.PALETTES["evening"])
+            band = self.BANDS.get(self._slot, self.BANDS["evening"])
             grad = cairo.LinearGradient(0, 0, W, H)
-            grad.add_color_stop_rgb(0.0, 0.078, 0.090, 0.137)   # #141723
-            grad.add_color_stop_rgb(0.5, 0.106, 0.106, 0.165)
-            grad.add_color_stop_rgb(1.0, 0.137, 0.094, 0.180)
+            grad.add_color_stop_rgb(0.0, *band[0])
+            grad.add_color_stop_rgb(0.5, *band[1])
+            grad.add_color_stop_rgb(1.0, *band[2])
             cr.set_source(grad)
             cr.rectangle(0, 0, W, H)
             cr.fill()
 
             cr.set_operator(cairo.OPERATOR_OVER)
-            for (r, g, b), bx, by, rr, peak in self.BLOBS:
+            for (r, g, b), bx, by, rr, peak in blobs:
                 cx, cy = bx * W, by * H
                 radius = rr * max(W, H)
                 rg = cairo.RadialGradient(cx, cy, 0, cx, cy, radius)
@@ -2061,6 +3019,15 @@ class VMShell(Gtk.Window):
         # Premier check rapide au démarrage (one-shot, ne repropage pas).
         GLib.timeout_add(2000,
                          lambda: (self._battery_watch_tick(), False)[1])
+
+        # Démarre l'historique du presse-papier (RAM uniquement).
+        try:
+            CLIP_HISTORY.start()
+        except Exception:
+            pass
+
+        # Rafraîchit les stats d'usage à la fermeture (catch-all).
+        self.connect("destroy", lambda *_: USAGE.end_all())
 
     # ---- Surveillance batterie ----------------------------------------
     def _read_battery_state(self):
@@ -2312,6 +3279,11 @@ class VMShell(Gtk.Window):
 
         section("Connexions")
         nav("all",        "Toutes les connexions", total)
+        nav("favorites",  "Favoris", favs)
+
+        section("Outils")
+        nav("history",    "Tableau de bord")
+        nav("settings",   "Paramètres")
 
         # spacer
         side.pack_start(Gtk.Label(), True, True, 0)
@@ -2765,11 +3737,11 @@ class VMShell(Gtk.Window):
             self._content.show_all(); return
 
         if self._nav_mode == "history":
-            self._sec_title.set_text("Historique")
-            self._sec_sub.set_text("Bientôt disponible")
-            self._content.pack_start(self._build_empty(
-                "🕒", "Pas d'historique", "Vos connexions récentes apparaîtront ici."),
-                False, False, 0)
+            self._sec_title.set_text("Tableau de bord d'usage")
+            self._sec_sub.set_text(
+                "Statistiques par VM (durée, fréquence, dernière session)")
+            self._content.pack_start(
+                self._build_usage_dashboard(), False, False, 0)
             self._content.show_all(); return
 
         if self._nav_mode == "favorites":
@@ -2943,6 +3915,11 @@ class VMShell(Gtk.Window):
         ev = Gtk.EventBox(); ev.add(card)
         ev.set_above_child(False)
         ev.connect("button-press-event", lambda w, e: self._on_card_click(e, conn))
+        # Pré-chauffe RDP au survol : on ouvre une connexion TCP rapide
+        # vers l'hôte pour amorcer DNS/ARP/route et rendre le clic suivant
+        # quasi instantané. Throttlé à 1× / 8s par VM.
+        ev.connect("enter-notify-event",
+                   lambda w, e, _c=conn: self._prefetch_host(_c))
         return ev
 
     def _on_card_click(self, e, conn):
@@ -3017,10 +3994,67 @@ class VMShell(Gtk.Window):
         info = Gtk.Label(
             label=(f"• xfreerdp : {find_xfreerdp() or 'NON INSTALLÉ'}\n"
                    f"• xdotool  : {shutil.which('xdotool') or 'NON INSTALLÉ'}\n"
+                   f"• arecord  : {shutil.which('arecord') or 'NON INSTALLÉ'}\n"
+                   f"• whisper  : {stt_available() or 'NON INSTALLÉ'}\n"
                    f"• Connexions : {len(self._connections)}"),
             xalign=0)
         info.get_style_context().add_class("vm-meta")
         b.pack_start(info, False, False, 0)
+
+        # ---- Auto-démarrage Linux --------------------------------------
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(6); sep.set_margin_bottom(6)
+        b.pack_start(sep, False, False, 0)
+
+        as_hdr = Gtk.Label(label="Lancement automatique", xalign=0)
+        as_hdr.get_style_context().add_class("form-title")
+        b.pack_start(as_hdr, False, False, 0)
+        as_sub = Gtk.Label(
+            label="Quand activé, VMShell démarre automatiquement à "
+                  "l'ouverture de ta session Linux.",
+            xalign=0)
+        as_sub.set_line_wrap(True)
+        as_sub.get_style_context().add_class("form-sub")
+        b.pack_start(as_sub, False, False, 0)
+
+        as_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        as_row.set_margin_top(4)
+        as_switch = Gtk.Switch()
+        as_switch.set_active(autostart_enabled())
+        as_state = Gtk.Label(xalign=0)
+        as_state.get_style_context().add_class("form-sub")
+
+        def _refresh_as_state():
+            on = autostart_enabled()
+            if on:
+                as_state.set_markup(
+                    f"<span>✅  Activé  ·  fichier : "
+                    f"<tt>{AUTOSTART_FILE}</tt></span>")
+                ctx = as_state.get_style_context()
+                ctx.remove_class("kpi-bad"); ctx.add_class("kpi-good")
+            else:
+                as_state.set_markup("<span>○  Désactivé</span>")
+                ctx = as_state.get_style_context()
+                ctx.remove_class("kpi-good")
+        _refresh_as_state()
+
+        def _on_as_toggle(_w, gparam):
+            ok = autostart_set(_w.get_active())
+            if not ok:
+                # Revert silencieusement si écriture impossible.
+                _w.set_active(autostart_enabled())
+            _refresh_as_state()
+        as_switch.connect("notify::active", _on_as_toggle)
+
+        as_row.pack_start(as_switch, False, False, 0)
+        as_row.pack_start(as_state, True, True, 0)
+        b.pack_start(as_row, False, False, 0)
+
+        # ---- Quitter ---------------------------------------------------
+        sep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep2.set_margin_top(6); sep2.set_margin_bottom(6)
+        b.pack_start(sep2, False, False, 0)
 
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
         quit_btn = Gtk.Button(label="Quitter VMShell")
@@ -3029,6 +4063,123 @@ class VMShell(Gtk.Window):
         row.pack_start(quit_btn, False, False, 0)
         b.pack_start(row, False, False, 0)
         return b
+
+    # -- Tableau de bord d'usage -----------------------------------------
+    def _build_usage_dashboard(self):
+        """Affiche par VM : durée totale, nb de connexions, dernière fois."""
+        wrap = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
+        wrap.set_margin_top(8)
+
+        # KPI globaux.
+        stats = USAGE.all_stats()
+        total_sec = USAGE.total_sec()
+        total_count = USAGE.total_count()
+        kpis = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for ico, val, t, sub, klass in [
+            ("⏱", fmt_duration(total_sec), "Temps total",
+             "Toutes VM confondues", "kpi-blue"),
+            ("🔁", str(total_count), "Sessions",
+             "Total cumulé", "kpi-violet"),
+            ("📊", str(len(stats)), "VM utilisées",
+             f"sur {len(self._connections)} configurées", "kpi-green"),
+        ]:
+            kpis.pack_start(
+                self._build_kpi(ico, val, t, sub, klass),
+                True, True, 0)
+        wrap.pack_start(kpis, False, False, 0)
+
+        # Tableau par VM, trié par durée totale.
+        if not stats:
+            wrap.pack_start(self._build_empty(
+                "🕒",
+                "Aucune session enregistrée",
+                "Lance une VM pour voir tes statistiques apparaître."),
+                False, False, 0)
+            return wrap
+
+        # Récupère un nom à jour depuis _connections si dispo.
+        names = {c["id"]: c["name"] for c in self._connections}
+
+        rows = sorted(
+            stats.items(),
+            key=lambda kv: kv[1].get("total_sec", 0), reverse=True)
+
+        # Header.
+        card = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        card.get_style_context().add_class("form-card")
+
+        head = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+        for txt, w in [("VM", 240), ("Durée totale", 140),
+                       ("Sessions", 100), ("Dernière", 200)]:
+            l = Gtk.Label(label=txt, xalign=0)
+            l.get_style_context().add_class("form-sub")
+            l.set_size_request(w, -1)
+            head.pack_start(l, False, False, 0)
+        card.pack_start(head, False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(2); sep.set_margin_bottom(2)
+        card.pack_start(sep, False, False, 0)
+
+        max_dur = max((r.get("total_sec", 0) for _, r in rows), default=1) or 1
+        for cid, r in rows:
+            line = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+
+            name = names.get(cid) or r.get("name", "?")
+            n = Gtk.Label(label=f"🖥  {name}", xalign=0)
+            n.get_style_context().add_class("vm-name")
+            n.set_size_request(240, -1)
+            n.set_ellipsize(Pango.EllipsizeMode.END)
+            line.pack_start(n, False, False, 0)
+
+            # Durée + barre proportionnelle.
+            dur_box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            dur_box.set_size_request(140, -1)
+            d = Gtk.Label(
+                label=fmt_duration(r.get("total_sec", 0)), xalign=0)
+            d.get_style_context().add_class("vm-meta")
+            bar = Gtk.ProgressBar()
+            bar.set_fraction(
+                min(1.0, r.get("total_sec", 0) / max_dur))
+            bar.set_show_text(False)
+            dur_box.pack_start(d, False, False, 0)
+            dur_box.pack_start(bar, False, False, 0)
+            line.pack_start(dur_box, False, False, 0)
+
+            cnt = Gtk.Label(
+                label=f"× {r.get('count', 0)}", xalign=0)
+            cnt.get_style_context().add_class("vm-meta")
+            cnt.set_size_request(100, -1)
+            line.pack_start(cnt, False, False, 0)
+
+            last_ts = r.get("last", 0)
+            if last_ts:
+                ago = int(time.time() - last_ts)
+                if ago < 60:
+                    when = "à l'instant"
+                elif ago < 3600:
+                    when = f"il y a {ago//60} min"
+                elif ago < 86400:
+                    when = f"il y a {ago//3600} h"
+                elif ago < 86400 * 30:
+                    when = f"il y a {ago//86400} j"
+                else:
+                    when = datetime.fromtimestamp(last_ts).strftime(
+                        "%d/%m/%Y")
+            else:
+                when = "jamais"
+            l = Gtk.Label(label=when, xalign=0)
+            l.get_style_context().add_class("vm-meta")
+            l.set_size_request(200, -1)
+            line.pack_start(l, False, False, 0)
+
+            card.pack_start(line, False, False, 0)
+
+        wrap.pack_start(card, False, False, 0)
+        return wrap
 
     # ---- Status helpers ------------------------------------------------
     def _status_label(self, st):
@@ -3203,6 +4354,40 @@ class VMShell(Gtk.Window):
         self._stack.set_visible_child_name("console")
         self._console.start(conn)
         self._esc_grab.start()
+        # Suivi d'usage : on note l'ouverture de la session.
+        try:
+            USAGE.start(conn)
+        except Exception:
+            pass
+
+    def _prefetch_host(self, conn):
+        """Pré-chauffe la connexion : ouverture TCP non bloquante vers la VM
+        au survol de sa carte. Cache DNS/ARP/route, le clic suivant gagne
+        plusieurs centaines de ms. Throttlé à 1 fois toutes les 8 secondes
+        par VM pour rester gratuit même en mouvement de souris."""
+        if not hasattr(self, "_prefetch_at"):
+            self._prefetch_at = {}
+        cid = conn.get("id")
+        now = time.time()
+        last = self._prefetch_at.get(cid, 0)
+        if now - last < 8.0:
+            return False
+        self._prefetch_at[cid] = now
+
+        host = conn.get("host"); port = conn.get("port")
+        if not host or not port:
+            return False
+
+        def _worker():
+            try:
+                with socket.create_connection(
+                        (host, int(port)), timeout=1.5):
+                    pass  # On ferme tout de suite : seul le warmup compte.
+            except OSError:
+                pass
+
+        threading.Thread(target=_worker, daemon=True).start()
+        return False
 
     def _auto_boost_network(self):
         """Applique en arrière-plan les optimisations réseau bas-latence.
@@ -3281,6 +4466,16 @@ echo OK
         if self._stack.get_visible_child_name() == "console":
             self._console.toggle_menu()
         return False
+
+    def _panic_mask_main(self):
+        """Masquage écran depuis la grille (hors session). Réutilise
+        l'overlay de la console."""
+        # On déclenche le même masque même sans session : l'overlay
+        # est plein écran et indépendant du stack.
+        try:
+            ConsolePage._panic_mask(self._console)
+        except Exception:
+            pass
 
     def _close_console(self):
         for cid in list(self._status.keys()):
@@ -3376,6 +4571,20 @@ echo OK
                 and self._stack.get_visible_child_name() == "console"
                 and self._console.has_sessions()):
             self._console._paste_clipboard_into_vm()
+            return True
+        # Ctrl+Shift+H : masquage écran (panique). Marche partout.
+        if ctrl and shift and kv in (Gdk.KEY_H, Gdk.KEY_h):
+            if self._stack.get_visible_child_name() == "console":
+                self._console._panic_mask()
+            else:
+                # Reproduit l'effet hors session : overlay sur la fenêtre.
+                self._panic_mask_main()
+            return True
+        # F12 : dictée vocale (uniquement en console avec une VM ouverte).
+        if (kv == Gdk.KEY_F12
+                and self._stack.get_visible_child_name() == "console"
+                and self._console.has_sessions()):
+            self._console._start_dictation_ui()
             return True
         # Ctrl+K or Ctrl+F -> focus search
         if ctrl and kv in (Gdk.KEY_k, Gdk.KEY_f):
