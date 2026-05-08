@@ -1142,7 +1142,7 @@ class ConsolePage(Gtk.Box):
         win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
         win.set_title("Mon PC")
         win.set_modal(True)
-        win.set_default_size(460, 0)
+        win.set_default_size(560, 0)
         win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
         try:
             top = self.get_toplevel()
@@ -1196,17 +1196,29 @@ class ConsolePage(Gtk.Box):
             pwr_box.pack_start(pwr_hdr, False, False, 0)
             pwr_row = Gtk.Box(
                 orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            pwr_row.set_homogeneous(True)
             for p in profiles:
                 emoji = {"power-saver": "🌙",
                          "balanced":    "⚖",
                          "performance": "🚀"}.get(p, "•")
-                lbl = {"power-saver": "Économie",
+                # Libellés courts pour que les 3 chips tiennent côte à côte.
+                lbl = {"power-saver": "Éco",
                        "balanced":    "Équilibré",
-                       "performance": "Performance"}.get(p, p)
-                b = Gtk.Button(label=f"{emoji}  {lbl}")
+                       "performance": "Perf"}.get(p, p)
+                b = Gtk.Button()
                 b.get_style_context().add_class("chip")
                 if p == cur_profile:
                     b.get_style_context().add_class("chip-active")
+                inner = Gtk.Box(
+                    orientation=Gtk.Orientation.VERTICAL, spacing=0)
+                e_lbl = Gtk.Label(label=emoji)
+                e_lbl.get_style_context().add_class("form-title")
+                t_lbl = Gtk.Label(label=lbl)
+                t_lbl.get_style_context().add_class("form-sub")
+                inner.pack_start(e_lbl, False, False, 0)
+                inner.pack_start(t_lbl, False, False, 0)
+                b.add(inner)
+                b.set_hexpand(True)
                 b.connect(
                     "clicked",
                     lambda _w, _p=p: self._apply_power_profile(_p, pwr_chips))
@@ -1854,6 +1866,159 @@ class VMShell(Gtk.Window):
         GLib.timeout_add_seconds(1, self._tick_clock)
         GLib.timeout_add(300,  lambda: (self._check_all_statuses(), False)[1])
         GLib.timeout_add_seconds(60, lambda: (self._check_all_statuses(), True)[1])
+
+        # Surveillance batterie : alerte à 10 %, action critique à 5 %.
+        self._bat_warned_low = False
+        self._bat_warned_critical = False
+        GLib.timeout_add_seconds(30, self._battery_watch_tick)
+        # Premier check rapide au démarrage (one-shot, ne repropage pas).
+        GLib.timeout_add(2000,
+                         lambda: (self._battery_watch_tick(), False)[1])
+
+    # ---- Surveillance batterie ----------------------------------------
+    def _read_battery_state(self):
+        try:
+            base = "/sys/class/power_supply"
+            if not os.path.isdir(base):
+                return None, None
+            for name in sorted(os.listdir(base)):
+                if not name.startswith("BAT"):
+                    continue
+                cap_p = os.path.join(base, name, "capacity")
+                st_p  = os.path.join(base, name, "status")
+                if not os.path.isfile(cap_p):
+                    continue
+                with open(cap_p) as f:
+                    pct = int(f.read().strip())
+                status = ""
+                if os.path.isfile(st_p):
+                    with open(st_p) as f:
+                        status = f.read().strip()
+                return pct, status
+        except (OSError, ValueError):
+            pass
+        return None, None
+
+    def _battery_watch_tick(self):
+        pct, status = self._read_battery_state()
+        if pct is None:
+            return True
+        on_battery = ("charg" not in status.lower() or
+                      status.lower().startswith("not"))
+        # On ne déclenche les alertes que si on est sur batterie.
+        if not on_battery or status.lower() == "full":
+            # Reset des flags dès qu'on rebranche / charge.
+            if pct >= 25:
+                self._bat_warned_low = False
+                self._bat_warned_critical = False
+            return True
+
+        # ---- 5 % : ACTION CRITIQUE ------------------------------------
+        if pct <= 5 and not self._bat_warned_critical:
+            self._bat_warned_critical = True
+            self._bat_warned_low = True  # évite le double pop-up
+            # 1) bascule en éco.
+            try:
+                if shutil.which("powerprofilesctl"):
+                    subprocess.run(
+                        ["powerprofilesctl", "set", "power-saver"],
+                        check=False, timeout=3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+            # 2) luminosité à 30 % via logind.
+            try:
+                base = "/sys/class/backlight"
+                if os.path.isdir(base):
+                    entries = sorted(os.listdir(base))
+                    if entries:
+                        bl_name = entries[0]
+                        with open(os.path.join(
+                                base, bl_name, "max_brightness")) as f:
+                            bmax = int(f.read().strip())
+                        target = max(1, int(bmax * 0.30))
+                        subprocess.run(
+                            ["busctl", "call",
+                             "org.freedesktop.login1",
+                             "/org/freedesktop/login1/session/auto",
+                             "org.freedesktop.login1.Session",
+                             "SetBrightness", "ssu",
+                             "backlight", bl_name, str(target)],
+                            check=False, timeout=2,
+                            stdout=subprocess.DEVNULL,
+                            stderr=subprocess.DEVNULL)
+            except (subprocess.SubprocessError, OSError, ValueError):
+                pass
+            # 3) pop-up de mise en garde.
+            self._battery_alert(
+                level="critical",
+                title="⚠  Batterie critique",
+                msg=(f"Il ne reste que <b>{pct}%</b> de batterie.\n\n"
+                     "L'ordinateur risque de s'éteindre prochainement.\n\n"
+                     "Mode économie d'énergie activé et luminosité "
+                     "abaissée à 30%. Branche le secteur dès que possible."))
+            return True
+
+        # ---- 10 % : avertissement -------------------------------------
+        if pct <= 10 and not self._bat_warned_low:
+            self._bat_warned_low = True
+            self._battery_alert(
+                level="warning",
+                title="⚠  Batterie faible",
+                msg=(f"Il reste <b>{pct}%</b> de batterie.\n\n"
+                     "Pense à brancher l'ordinateur sur le secteur."))
+        return True
+
+    def _battery_alert(self, level, title, msg):
+        """Pop-up modal grand format pour alerte batterie."""
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Batterie")
+        win.set_modal(True)
+        win.set_default_size(560, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            win.set_transient_for(self)
+        except Exception:
+            pass
+        win.set_keep_above(True)
+        win.get_style_context().add_class("menu-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_margin_start(24); outer.set_margin_end(24)
+        outer.set_margin_top(20);   outer.set_margin_bottom(20)
+        win.add(outer)
+
+        t = Gtk.Label(xalign=0)
+        t.set_markup(f"<span size='xx-large' weight='bold'>{title}</span>")
+        cls = "kpi-bad" if level == "critical" else "kpi-warn"
+        t.get_style_context().add_class(cls)
+        outer.pack_start(t, False, False, 0)
+
+        body = Gtk.Label(xalign=0)
+        body.set_line_wrap(True)
+        body.set_markup(msg)
+        outer.pack_start(body, False, False, 0)
+
+        btn = Gtk.Button(label="J'ai compris")
+        btn.get_style_context().add_class("chip")
+        if level == "critical":
+            btn.get_style_context().add_class("chip-danger")
+        btn.connect("clicked", lambda *_: win.destroy())
+        outer.pack_start(btn, False, False, 6)
+
+        # Petit son pour attirer l'attention.
+        try:
+            sound = ("dialog-warning" if level == "warning"
+                     else "dialog-error")
+            if shutil.which("canberra-gtk-play"):
+                subprocess.Popen(
+                    ["canberra-gtk-play", "-i", sound],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
+
+        win.show_all()
+        win.present()
 
     # ---- CSS -----------------------------------------------------------
     def _apply_css(self):
