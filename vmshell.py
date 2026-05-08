@@ -864,6 +864,23 @@ class ConsolePage(Gtk.Box):
 
             self._menu_box.pack_start(grid, False, False, 0)
 
+        # ---- PC HÔTE -------------------------------------------------
+        host_btn = Gtk.Button()
+        host_btn.get_style_context().add_class("menu-item")
+        host_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        host_lbl = Gtk.Label(
+            label="💻  Mon PC (batterie, luminosité, volume…)",
+            xalign=0)
+        host_lbl.set_hexpand(True)
+        host_row.pack_start(host_lbl, True, True, 0)
+        host_btn.add(host_row)
+        host_btn.set_tooltip_text(
+            "Affiche les paramètres de ton ordinateur Linux : "
+            "batterie restante, mode énergie, luminosité, volume.")
+        host_btn.connect("clicked", lambda *_: self._open_host_panel())
+        self._menu_box.pack_start(host_btn, False, False, 0)
+
         # ---- MODE DE PERFORMANCE ----
         hdr_p = Gtk.Label(label="MODE DE PERFORMANCE", xalign=0)
         hdr_p.get_style_context().add_class("nav-section")
@@ -1114,6 +1131,274 @@ class ConsolePage(Gtk.Box):
                 pass
             return False
         GLib.timeout_add(180, _do_type)
+
+    # -- Panneau "PC HÔTE" ------------------------------------------------
+    def _open_host_panel(self):
+        """Popup avec les paramètres de l'ordinateur local : batterie,
+        mode énergie (perf/écono), luminosité écran, volume audio."""
+        self._hide_menu()
+        win = Gtk.Window(type=Gtk.WindowType.TOPLEVEL)
+        win.set_title("Mon PC")
+        win.set_modal(True)
+        win.set_default_size(420, 0)
+        win.set_position(Gtk.WindowPosition.CENTER_ON_PARENT)
+        try:
+            top = self.get_toplevel()
+            if isinstance(top, Gtk.Window):
+                win.set_transient_for(top)
+        except Exception:
+            pass
+        win.get_style_context().add_class("menu-popup")
+
+        outer = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=14)
+        outer.set_margin_start(18); outer.set_margin_end(18)
+        outer.set_margin_top(16);   outer.set_margin_bottom(16)
+        win.add(outer)
+
+        title = Gtk.Label(label="💻  Mon PC", xalign=0)
+        title.get_style_context().add_class("section-title")
+        outer.pack_start(title, False, False, 0)
+        sub = Gtk.Label(
+            label="Paramètres de ton ordinateur Linux",
+            xalign=0)
+        sub.get_style_context().add_class("form-sub")
+        outer.pack_start(sub, False, False, 0)
+
+        # ---- BATTERIE ---------------------------------------------------
+        bat_pct, bat_status = self._read_battery()
+        bat_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        bat_hdr = Gtk.Label(label="🔋  Batterie", xalign=0)
+        bat_hdr.get_style_context().add_class("nav-section")
+        bat_box.pack_start(bat_hdr, False, False, 0)
+        if bat_pct is None:
+            bat_lbl = Gtk.Label(label="Aucune batterie détectée.", xalign=0)
+            bat_lbl.get_style_context().add_class("form-sub")
+            bat_box.pack_start(bat_lbl, False, False, 0)
+        else:
+            bar = Gtk.ProgressBar()
+            bar.set_fraction(max(0.0, min(1.0, bat_pct / 100.0)))
+            bar.set_show_text(True)
+            icon = "⚡" if "charg" in (bat_status or "").lower() else "🔋"
+            bar.set_text(f"{icon}  {bat_pct}%  ·  {bat_status or 'inconnu'}")
+            bat_box.pack_start(bar, False, False, 0)
+        outer.pack_start(bat_box, False, False, 0)
+
+        # ---- MODE ÉNERGIE ----------------------------------------------
+        cur_profile, profiles = self._read_power_profile()
+        if profiles:
+            pwr_box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=4)
+            pwr_hdr = Gtk.Label(label="⚙  Mode énergie", xalign=0)
+            pwr_hdr.get_style_context().add_class("nav-section")
+            pwr_box.pack_start(pwr_hdr, False, False, 0)
+            pwr_row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            for p in profiles:
+                emoji = {"power-saver": "🌙",
+                         "balanced":    "⚖",
+                         "performance": "🚀"}.get(p, "•")
+                lbl = {"power-saver": "Économie",
+                       "balanced":    "Équilibré",
+                       "performance": "Performance"}.get(p, p)
+                b = Gtk.Button(label=f"{emoji}  {lbl}")
+                b.get_style_context().add_class("chip")
+                if p == cur_profile:
+                    b.get_style_context().add_class("chip-active")
+                b.connect("clicked",
+                          lambda _w, _p=p, _w2=win:
+                          self._set_power_profile(_p, _w2))
+                pwr_row.pack_start(b, True, True, 0)
+            pwr_box.pack_start(pwr_row, False, False, 0)
+            outer.pack_start(pwr_box, False, False, 0)
+
+        # ---- LUMINOSITÉ -------------------------------------------------
+        bl_path, bl_cur, bl_max = self._read_brightness()
+        if bl_path is not None and bl_max:
+            br_box = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            br_hdr = Gtk.Label(label="💡  Luminosité", xalign=0)
+            br_hdr.get_style_context().add_class("nav-section")
+            br_box.pack_start(br_hdr, False, False, 0)
+            adj = Gtk.Adjustment(
+                value=bl_cur, lower=max(1, int(bl_max * 0.05)),
+                upper=bl_max, step_increment=max(1, bl_max // 20),
+                page_increment=max(1, bl_max // 10))
+            scale = Gtk.Scale(
+                orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj)
+            scale.set_draw_value(False)
+            scale.set_hexpand(True)
+            scale.connect(
+                "value-changed",
+                lambda w, _p=bl_path: self._set_brightness(_p, w.get_value()))
+            br_box.pack_start(scale, False, False, 0)
+            outer.pack_start(br_box, False, False, 0)
+
+        # ---- VOLUME -----------------------------------------------------
+        vol = self._read_volume()
+        vol_box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
+        vol_hdr = Gtk.Label(label="🔊  Volume", xalign=0)
+        vol_hdr.get_style_context().add_class("nav-section")
+        vol_box.pack_start(vol_hdr, False, False, 0)
+        if vol is None:
+            no_vol = Gtk.Label(
+                label="Contrôle du volume indisponible "
+                      "(installe pactl/pulseaudio-utils).",
+                xalign=0)
+            no_vol.get_style_context().add_class("form-sub")
+            vol_box.pack_start(no_vol, False, False, 0)
+        else:
+            adj_v = Gtk.Adjustment(
+                value=vol, lower=0, upper=150,
+                step_increment=5, page_increment=10)
+            scale_v = Gtk.Scale(
+                orientation=Gtk.Orientation.HORIZONTAL, adjustment=adj_v)
+            scale_v.set_draw_value(True)
+            scale_v.set_value_pos(Gtk.PositionType.RIGHT)
+            scale_v.set_hexpand(True)
+            for mark in (0, 50, 100):
+                scale_v.add_mark(mark, Gtk.PositionType.BOTTOM, None)
+            scale_v.connect(
+                "value-changed",
+                lambda w: self._set_volume(int(w.get_value())))
+            vol_box.pack_start(scale_v, False, False, 0)
+        outer.pack_start(vol_box, False, False, 0)
+
+        # ---- Fermer -----------------------------------------------------
+        close = Gtk.Button(label="Fermer")
+        close.get_style_context().add_class("chip")
+        close.connect("clicked", lambda *_: win.destroy())
+        outer.pack_start(close, False, False, 6)
+
+        win.show_all()
+
+    # -- Helpers système hôte --------------------------------------------
+    def _read_battery(self):
+        try:
+            base = "/sys/class/power_supply"
+            if not os.path.isdir(base):
+                return None, None
+            for name in sorted(os.listdir(base)):
+                if not name.startswith("BAT"):
+                    continue
+                cap_p = os.path.join(base, name, "capacity")
+                st_p  = os.path.join(base, name, "status")
+                if not os.path.isfile(cap_p):
+                    continue
+                with open(cap_p) as f:
+                    pct = int(f.read().strip())
+                status = ""
+                if os.path.isfile(st_p):
+                    with open(st_p) as f:
+                        status = f.read().strip()
+                return pct, status
+        except (OSError, ValueError):
+            pass
+        return None, None
+
+    def _read_power_profile(self):
+        # power-profiles-daemon (Fedora/Ubuntu modernes).
+        if shutil.which("powerprofilesctl"):
+            try:
+                cur = subprocess.check_output(
+                    ["powerprofilesctl", "get"],
+                    text=True, timeout=2).strip()
+                lst = subprocess.check_output(
+                    ["powerprofilesctl", "list"],
+                    text=True, timeout=2)
+                profs = []
+                for line in lst.splitlines():
+                    line = line.strip()
+                    for p in ("performance", "balanced", "power-saver"):
+                        if line.startswith(p + ":") or line == p + ":":
+                            if p not in profs:
+                                profs.append(p)
+                if not profs:
+                    profs = ["power-saver", "balanced", "performance"]
+                return cur, profs
+            except (subprocess.SubprocessError, OSError):
+                pass
+        return None, []
+
+    def _set_power_profile(self, profile, win):
+        if shutil.which("powerprofilesctl"):
+            try:
+                subprocess.run(
+                    ["powerprofilesctl", "set", profile],
+                    check=False, timeout=3)
+            except (subprocess.SubprocessError, OSError):
+                pass
+        # Recharge le panneau pour refléter l'état.
+        try:
+            win.destroy()
+        except Exception:
+            pass
+        GLib.idle_add(self._open_host_panel)
+
+    def _read_brightness(self):
+        try:
+            base = "/sys/class/backlight"
+            if not os.path.isdir(base):
+                return None, 0, 0
+            entries = sorted(os.listdir(base))
+            if not entries:
+                return None, 0, 0
+            path = os.path.join(base, entries[0])
+            with open(os.path.join(path, "max_brightness")) as f:
+                bmax = int(f.read().strip())
+            with open(os.path.join(path, "brightness")) as f:
+                bcur = int(f.read().strip())
+            return path, bcur, bmax
+        except (OSError, ValueError):
+            return None, 0, 0
+
+    def _set_brightness(self, path, value):
+        v = int(max(1, value))
+        # brightnessctl gère les permissions, sinon écriture directe.
+        bl_name = os.path.basename(path)
+        if shutil.which("brightnessctl"):
+            try:
+                subprocess.Popen(
+                    ["brightnessctl", "-d", bl_name, "set", str(v)],
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL)
+                return
+            except OSError:
+                pass
+        try:
+            with open(os.path.join(path, "brightness"), "w") as f:
+                f.write(str(v))
+        except OSError:
+            pass
+
+    def _read_volume(self):
+        if not shutil.which("pactl"):
+            return None
+        try:
+            out = subprocess.check_output(
+                ["pactl", "get-sink-volume", "@DEFAULT_SINK@"],
+                text=True, timeout=2)
+            # ex: "Volume: front-left: 65536 / 100% / 0,00 dB ..."
+            for tok in out.replace(",", ".").split():
+                if tok.endswith("%"):
+                    try:
+                        return int(tok.rstrip("%"))
+                    except ValueError:
+                        continue
+        except (subprocess.SubprocessError, OSError):
+            pass
+        return None
+
+    def _set_volume(self, percent):
+        if not shutil.which("pactl"):
+            return
+        p = max(0, min(150, int(percent)))
+        try:
+            subprocess.Popen(
+                ["pactl", "set-sink-volume", "@DEFAULT_SINK@", f"{p}%"],
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL)
+        except OSError:
+            pass
 
     def _shortcuts_for(self, conn):
         proto = conn.get("protocol", "rdp")
