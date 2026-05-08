@@ -1069,332 +1069,115 @@ class ConsolePage(Gtk.Box):
 
     # -- Menu --------------------------------------------------------------
     def _populate_menu(self):
+        """Menu Échap à onglets : Sessions / Infos / Outils / Perf.
+        Réduit la hauteur globale en regroupant les sections dans un
+        Gtk.Stack contrôlé par une rangée de boutons-onglets en haut.
+        L'onglet actif est conservé entre les rebuilds via
+        ``self._menu_active_tab`` (par défaut: 'sessions')."""
         for c in self._menu_box.get_children():
             self._menu_box.remove(c)
+        if not hasattr(self, "_menu_active_tab"):
+            self._menu_active_tab = "sessions"
         conn = (self._current.conn if self._current else {}) or {}
+
+        # ---- En-tête ----------------------------------------------------
+        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
         title = Gtk.Label(label=f"{conn.get('name', 'Session')}", xalign=0)
         title.get_style_context().add_class("form-title")
         sub = Gtk.Label(
             label=f"{conn.get('host','')}:{conn.get('port','')}  ·  "
                   f"{conn.get('protocol','').upper()}", xalign=0)
         sub.get_style_context().add_class("form-sub")
-        self._menu_box.pack_start(title, False, False, 0)
-        self._menu_box.pack_start(sub,   False, False, 0)
+        header.pack_start(title, False, False, 0)
+        header.pack_start(sub,   False, False, 0)
+        self._menu_box.pack_start(header, False, False, 0)
 
-        # ---- SESSIONS section ----
-        if len(self._sessions) > 0:
-            sep0 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-            sep0.set_margin_top(6); sep0.set_margin_bottom(6)
-            self._menu_box.pack_start(sep0, False, False, 0)
-            hdr0 = Gtk.Label(label="SESSIONS OUVERTES", xalign=0)
-            hdr0.get_style_context().add_class("nav-section")
-            self._menu_box.pack_start(hdr0, False, False, 0)
-            for s in self._sessions:
-                row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL,
-                              spacing=4)
-                # Bouton principal : bascule sur la session.
-                b = Gtk.Button()
-                b.get_style_context().add_class("menu-item")
-                if s is self._current:
-                    b.get_style_context().add_class("active")
-                marker = "●" if s is self._current else "○"
-                lbl = Gtk.Label(
-                    label=f"{marker}  {s.conn.get('name','?')}  "
-                          f"({s.conn.get('protocol','?').upper()})",
-                    xalign=0)
-                lbl.set_hexpand(True)
-                b.add(lbl)
-                b.set_hexpand(True)
-                b.connect("clicked",
-                          lambda _w, _s=s: self._on_session_click(_s))
-                # Click molette / droit ferme la session.
-                b.connect("button-press-event",
-                          lambda _w, e, _s=s: self._on_session_btn(e, _s))
-                row.pack_start(b, True, True, 0)
+        # ---- Construction des 4 pages d'onglets -------------------------
+        page_sessions = self._build_tab_sessions()
+        page_infos    = self._build_tab_infos()
+        page_outils   = self._build_tab_outils()
+        page_perf     = self._build_tab_perf()
 
-                # Vrai bouton de fermeture (et non plus un Label).
-                close_btn = Gtk.Button(label="✕")
-                close_btn.get_style_context().add_class("menu-item")
-                close_btn.get_style_context().add_class("chip-danger")
-                close_btn.set_tooltip_text("Fermer cette session")
-                close_btn.connect(
-                    "clicked",
-                    lambda _w, _s=s: self._on_session_close(_s))
-                row.pack_end(close_btn, False, False, 0)
+        stack = Gtk.Stack()
+        stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
+        stack.set_transition_duration(180)
+        stack.add_named(page_sessions, "sessions")
+        stack.add_named(page_infos,    "infos")
+        stack.add_named(page_outils,   "outils")
+        stack.add_named(page_perf,     "perf")
 
-                self._menu_box.pack_start(row, False, False, 0)
+        # Restaure l'onglet actif demandé.
+        valid = {"sessions", "infos", "outils", "perf"}
+        if self._menu_active_tab not in valid:
+            self._menu_active_tab = "sessions"
+        # Si pas de session ouverte : "Infos" et "Outils" n'ont pas de
+        # sens → on bascule sur "Sessions" automatiquement.
+        if self._current is None and self._menu_active_tab in ("infos",
+                                                                "outils"):
+            self._menu_active_tab = "sessions"
+        stack.set_visible_child_name(self._menu_active_tab)
 
-            new_btn = Gtk.Button(label="+  Ouvrir une autre VM")
-            new_btn.get_style_context().add_class("menu-item")
-            new_btn.connect("clicked", lambda *_: self._on_request_new_session())
-            self._menu_box.pack_start(new_btn, False, False, 0)
+        # ---- Barre d'onglets -------------------------------------------
+        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
+        tabs.set_homogeneous(True)
+        tabs.set_margin_top(8); tabs.set_margin_bottom(8)
 
-            # ---- Presse-papier partagé -------------------------------
-            paste_btn = Gtk.Button()
-            paste_btn.get_style_context().add_class("menu-item")
-            paste_row = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-            paste_lbl = Gtk.Label(
-                label="📋  Coller le presse-papier dans la VM",
-                xalign=0)
-            paste_lbl.set_hexpand(True)
-            paste_kbd = Gtk.Label(label="Ctrl  Shift  V")
-            paste_kbd.get_style_context().add_class("kbd")
-            paste_row.pack_start(paste_lbl, True, True, 0)
-            paste_row.pack_end(paste_kbd, False, False, 0)
-            paste_btn.add(paste_row)
-            paste_btn.set_tooltip_text(
-                "Injecte le contenu du presse-papier local dans "
-                "la VM courante (utile si la synchro RDP automatique "
-                "ne fonctionne pas).")
-            paste_btn.connect(
-                "clicked", lambda *_: self._paste_clipboard_into_vm())
-            self._menu_box.pack_start(paste_btn, False, False, 0)
-
-        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep.set_margin_top(6); sep.set_margin_bottom(6)
-        self._menu_box.pack_start(sep, False, False, 0)
-
-        # ---- INFOS DE CONNEXION ----
-        if self._current is not None:
-            hdr_i = Gtk.Label(label="INFOS DE CONNEXION", xalign=0)
-            hdr_i.get_style_context().add_class("nav-section")
-            self._menu_box.pack_start(hdr_i, False, False, 0)
-
-            grid = Gtk.Grid()
-            grid.set_column_spacing(14); grid.set_row_spacing(4)
-            grid.set_margin_start(4); grid.set_margin_top(2); grid.set_margin_bottom(4)
-
-            def _add(row, label, value, value_class=None):
-                k = Gtk.Label(label=label, xalign=0)
-                k.get_style_context().add_class("form-sub")
-                v = Gtk.Label(label=value, xalign=0)
-                v.set_selectable(True)
-                if value_class:
-                    v.get_style_context().add_class(value_class)
-                grid.attach(k, 0, row, 1, 1)
-                grid.attach(v, 1, row, 1, 1)
-
-            s = self._current
-            c = s.conn
-            elapsed = int(time.time() - s.started_at)
-            h, rem = divmod(elapsed, 3600)
-            m, sec = divmod(rem, 60)
-            uptime = f"{h:02d}:{m:02d}:{sec:02d}" if h else f"{m:02d}:{sec:02d}"
-            started = datetime.fromtimestamp(s.started_at).strftime("%H:%M:%S")
-
-            # Latency (cached on session, refresh in background)
-            self._refresh_latency_async(s)
-            if s.latency_ms is None:
-                lat_str, lat_cls = "mesure…", None
-            else:
-                lat_str = f"{s.latency_ms} ms"
-                lat_cls = ("kpi-good"  if s.latency_ms < 30 else
-                           "kpi-warn"  if s.latency_ms < 80 else
-                           "kpi-bad")
-
-            running = (s.proc is not None and s.proc.poll() is None)
-            etat_str = "● Actif" if running else "○ Déconnecté"
-            etat_cls = "kpi-good" if running else "kpi-bad"
-
-            proto = c.get("protocol", "?").upper()
-            os_name = (c.get("os") or "—").capitalize()
-
-            _add(0, "État",       etat_str, etat_cls)
-            _add(1, "Protocole",  f"{proto}  ·  {os_name}")
-            _add(2, "Hôte",       f"{c.get('host','')}:{c.get('port','')}")
-            _add(3, "Utilisateur", c.get("user", "—"))
-            _add(4, "Ouverte à",  started)
-            _add(5, "Durée",      uptime)
-            _add(6, "Latence",    lat_str, lat_cls)
-
-            if proto == "RDP":
-                # Quality / redirections summary.
-                disp = Gdk.Display.get_default()
-                mon = disp.get_primary_monitor() or disp.get_monitor(0)
-                geo = mon.get_geometry()
-                gpu_v = (HW_INFO.get("gpu_vendor") or "aucun").upper()
-                gpu_ok = HW_INFO.get("gpu_accel")
-                gpu_str = f"{gpu_v} (accélération)" if gpu_ok else f"{gpu_v} (CPU only)"
-                if self._perf_profile == "gamer":
-                    if gpu_ok:
-                        mode_str = "🎮 Gamer  ·  H.264 + RemoteFX (GPU)"
-                        aff_str  = f"{geo.width}×{geo.height}  ·  AVC420 32 bpp"
-                    else:
-                        mode_str = "🎮 Gamer  ·  RemoteFX léger (CPU)"
-                        aff_str  = f"{geo.width}×{geo.height}  ·  RFX 16 bpp"
-                    aud_str  = "Pulse  ·  faible latence"
-                else:
-                    if gpu_ok:
-                        mode_str = "🌙 Tranquille  ·  qualité max (GPU)"
-                        aff_str  = f"{geo.width}×{geo.height}  ·  AVC444 32 bpp"
-                    else:
-                        mode_str = "🌙 Tranquille  ·  qualité (CPU)"
-                        aff_str  = f"{geo.width}×{geo.height}  ·  RFX 32 bpp"
-                    aud_str  = "Pulse  ·  micro activé"
-                _add(7, "Mode",      mode_str)
-                _add(8, "Affichage", aff_str)
-                _add(9, "Audio",     aud_str)
-                _add(10, "Matériel", gpu_str)
-                _add(11, "Partages", "Presse-papiers · /home · imprimantes · USB · carte à puce")
-                _add(12, "Reconnexion", "auto (5 essais)")
-
-            self._menu_box.pack_start(grid, False, False, 0)
-
-        # ---- PC HÔTE -------------------------------------------------
-        host_btn = Gtk.Button()
-        host_btn.get_style_context().add_class("menu-item")
-        host_row = Gtk.Box(
-            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-        host_lbl = Gtk.Label(
-            label="💻  Mon PC (batterie, luminosité, volume…)",
-            xalign=0)
-        host_lbl.set_hexpand(True)
-        host_row.pack_start(host_lbl, True, True, 0)
-        host_btn.add(host_row)
-        host_btn.set_tooltip_text(
-            "Affiche les paramètres de ton ordinateur Linux : "
-            "batterie restante, mode énergie, luminosité, volume.")
-        host_btn.connect("clicked", lambda *_: self._open_host_panel())
-        self._menu_box.pack_start(host_btn, False, False, 0)
-
-        # ---- OUTILS DE SESSION -----------------------------------------
-        if self._current is not None:
-            sep_o = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-            sep_o.set_margin_top(6); sep_o.set_margin_bottom(6)
-            self._menu_box.pack_start(sep_o, False, False, 0)
-            hdr_o = Gtk.Label(label="OUTILS DE SESSION", xalign=0)
-            hdr_o.get_style_context().add_class("nav-section")
-            self._menu_box.pack_start(hdr_o, False, False, 0)
-
-            def _mk_tool(label, tip, cb, kbd=None):
-                b = Gtk.Button()
-                b.get_style_context().add_class("menu-item")
-                row = Gtk.Box(
-                    orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
-                lbl = Gtk.Label(label=label, xalign=0)
-                lbl.set_hexpand(True)
-                row.pack_start(lbl, True, True, 0)
-                if kbd:
-                    k = Gtk.Label(label=kbd)
-                    k.get_style_context().add_class("kbd")
-                    row.pack_end(k, False, False, 0)
-                b.add(row)
-                b.set_tooltip_text(tip)
-                b.connect("clicked", lambda *_: cb())
-                return b
-
-            # Historique presse-papier (10 derniers).
-            self._menu_box.pack_start(_mk_tool(
-                f"📚  Historique presse-papier  "
-                f"({len(CLIP_HISTORY.items())})",
-                "Affiche les 10 derniers textes que tu as copiés "
-                "et te permet de les recoller dans la VM.",
-                self._open_clip_history_popup), False, False, 0)
-
-            # Test de débit.
-            self._menu_box.pack_start(_mk_tool(
-                "🚀  Tester ma connexion vers cette VM",
-                "Mesure ping ICMP + latence TCP, donne un verdict "
-                "(Excellent / Bon / Acceptable / Mauvais).",
-                self._open_speedtest_popup), False, False, 0)
-
-            # Dictée vocale.
-            stt_lbl = ("🎙  Dictée vocale (parle à la VM)"
-                       if stt_available()
-                       else "🎙  Dictée vocale (whisper non installé)")
-            self._menu_box.pack_start(_mk_tool(
-                stt_lbl,
-                "Enregistre 6 secondes de dictée et tape le texte "
-                "transcrit dans la VM. Nécessite whisper / whisper.cpp.",
-                self._start_dictation_ui, kbd="F12"), False, False, 0)
-
-            # Masquage écran (panique).
-            self._menu_box.pack_start(_mk_tool(
-                "🛡  Masquer l'écran (quelqu'un arrive)",
-                "Couvre instantanément toutes les VM avec un fond "
-                "neutre. Cliquer pour reprendre.",
-                self._panic_mask, kbd="Ctrl  Shift  H"), False, False, 0)
-
-        # ---- MODE DE PERFORMANCE ----
-        hdr_p = Gtk.Label(label="MODE DE PERFORMANCE", xalign=0)
-        hdr_p.get_style_context().add_class("nav-section")
-        hdr_p.set_margin_top(6)
-        self._menu_box.pack_start(hdr_p, False, False, 0)
-
-        prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        prow.set_margin_start(4); prow.set_margin_end(4)
-
-        def _mk_profile_btn(name, label, sublabel):
+        def _mk_tab(name, label, count=None):
             b = Gtk.Button()
             b.get_style_context().add_class("chip")
-            if self._perf_profile == name:
+            b.get_style_context().add_class("menu-tab")
+            if name == self._menu_active_tab:
                 b.get_style_context().add_class("chip-active")
-            v = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=2)
-            t = Gtk.Label(label=label, xalign=0.5)
-            t.get_style_context().add_class("form-title")
-            d = Gtk.Label(label=sublabel, xalign=0.5)
-            d.get_style_context().add_class("form-sub")
-            v.pack_start(t, False, False, 0)
-            v.pack_start(d, False, False, 0)
-            b.add(v)
-            b.connect("button-press-event",
-                      lambda *_: (self._set_profile(name), True)[1])
+            box = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            l = Gtk.Label(label=label)
+            box.pack_start(l, True, True, 0)
+            if count is not None and count > 0:
+                bdg = Gtk.Label(label=str(count))
+                bdg.get_style_context().add_class("nav-badge")
+                box.pack_end(bdg, False, False, 0)
+            b.add(box)
+            b.set_hexpand(True)
+
+            def _switch(*_):
+                self._menu_active_tab = name
+                stack.set_visible_child_name(name)
+                # Rafraîchit le style des onglets.
+                for child in tabs.get_children():
+                    ctx = child.get_style_context()
+                    ctx.remove_class("chip-active")
+                ctx = b.get_style_context()
+                ctx.add_class("chip-active")
+                return True
+            b.connect("clicked", _switch)
             return b
 
-        prow.pack_start(_mk_profile_btn(
-            "tranquille", "🌙  Tranquille",
-            "Qualité max · audio HD · micro"), True, True, 0)
-        prow.pack_start(_mk_profile_btn(
-            "gamer", "🎮  Gamer",
-            "Fluidité max · 16 bpp · micro coupé"), True, True, 0)
-        self._menu_box.pack_start(prow, False, False, 0)
-
-        hint = Gtk.Label(
-            label="Le changement relance la session RDP active.",
-            xalign=0)
-        hint.get_style_context().add_class("form-sub")
-        hint.set_margin_top(2)
-        self._menu_box.pack_start(hint, False, False, 0)
-
-        # ---- AUTO-DIAGNOSTIC ----
+        # Compteur sessions sur le 1er onglet.
+        n_sess = len(self._sessions)
+        # Diagnostic FAIL/WARN compté sur l'onglet Perf.
+        diag_warn = 0
         try:
-            diag = DIAG  # global rempli par run_self_check()
+            if DIAG and DIAG.get("results"):
+                diag_warn = sum(
+                    1 for r in DIAG["results"] if r[0] in ("FAIL", "WARN"))
         except NameError:
-            diag = None
-        if diag and diag["results"]:
-            sep_d = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-            sep_d.set_margin_top(6); sep_d.set_margin_bottom(6)
-            self._menu_box.pack_start(sep_d, False, False, 0)
+            pass
 
-            hdr_d = Gtk.Label(
-                label=f"AUTO-DIAGNOSTIC  ·  {diag['ok']} OK · "
-                      f"{diag['warn']} ⚠  ·  {diag['fail']} ✗",
-                xalign=0)
-            hdr_d.get_style_context().add_class("nav-section")
-            self._menu_box.pack_start(hdr_d, False, False, 0)
+        tabs.pack_start(_mk_tab("sessions", "🖥  VM", n_sess),
+                        True, True, 0)
+        if self._current is not None:
+            tabs.pack_start(_mk_tab("infos", "ℹ  Infos"),
+                            True, True, 0)
+            tabs.pack_start(_mk_tab("outils", "🛠  Outils"),
+                            True, True, 0)
+        tabs.pack_start(_mk_tab("perf", "⚡  Perf", diag_warn),
+                        True, True, 0)
 
-            # Affiche en priorité les FAIL puis WARN. Cache les OK pour
-            # garder le panneau lisible (sauf si tout est OK).
-            shown = [r for r in diag["results"] if r[0] in ("FAIL", "WARN")]
-            if not shown:
-                shown = [("OK", "Toutes les vérifications sont passées", "")]
-
-            for level, label_, detail in shown[:8]:
-                line = Gtk.Label(xalign=0)
-                line.set_line_wrap(True)
-                icon = {"OK": "✅", "WARN": "⚠", "FAIL": "✗"}[level]
-                txt = f"{icon}  <b>{GLib.markup_escape_text(label_)}</b>"
-                if detail:
-                    txt += f"  <span alpha='65%'>· {GLib.markup_escape_text(detail)}</span>"
-                line.set_markup(txt)
-                cls = {"OK": "kpi-good", "WARN": "kpi-warn",
-                       "FAIL": "kpi-bad"}[level]
-                line.get_style_context().add_class(cls)
-                self._menu_box.pack_start(line, False, False, 0)
+        self._menu_box.pack_start(tabs, False, False, 0)
+        self._menu_box.pack_start(stack, True, True, 0)
 
         sep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep2.set_margin_top(6); sep2.set_margin_bottom(6)
+        sep2.set_margin_top(8); sep2.set_margin_bottom(6)
         self._menu_box.pack_start(sep2, False, False, 0)
 
         # Bottom actions.
@@ -1413,6 +1196,321 @@ class ConsolePage(Gtk.Box):
         self._menu_box.pack_start(row, False, False, 0)
 
         self._menu_box.show_all()
+
+    # ---- Onglets du menu Échap -----------------------------------------
+    def _build_tab_sessions(self):
+        """Onglet Sessions : liste des VM ouvertes + "+ Nouvelle" +
+        "Coller presse-papier"."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        if len(self._sessions) == 0:
+            empty = Gtk.Label(
+                label="\nAucune session ouverte.\n"
+                      "Choisis une VM dans la grille pour démarrer.",
+                xalign=0)
+            empty.get_style_context().add_class("form-sub")
+            page.pack_start(empty, False, False, 0)
+            return page
+
+        for s in self._sessions:
+            row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
+            b = Gtk.Button()
+            b.get_style_context().add_class("menu-item")
+            if s is self._current:
+                b.get_style_context().add_class("active")
+            marker = "●" if s is self._current else "○"
+            lbl = Gtk.Label(
+                label=f"{marker}  {s.conn.get('name','?')}  "
+                      f"({s.conn.get('protocol','?').upper()})",
+                xalign=0)
+            lbl.set_hexpand(True)
+            b.add(lbl)
+            b.set_hexpand(True)
+            b.connect("clicked",
+                      lambda _w, _s=s: self._on_session_click(_s))
+            b.connect("button-press-event",
+                      lambda _w, e, _s=s: self._on_session_btn(e, _s))
+            row.pack_start(b, True, True, 0)
+
+            close_btn = Gtk.Button(label="✕")
+            close_btn.get_style_context().add_class("menu-item")
+            close_btn.get_style_context().add_class("chip-danger")
+            close_btn.set_tooltip_text("Fermer cette session")
+            close_btn.connect(
+                "clicked",
+                lambda _w, _s=s: self._on_session_close(_s))
+            row.pack_end(close_btn, False, False, 0)
+            page.pack_start(row, False, False, 0)
+
+        new_btn = Gtk.Button(label="+  Ouvrir une autre VM")
+        new_btn.get_style_context().add_class("menu-item")
+        new_btn.connect(
+            "clicked", lambda *_: self._on_request_new_session())
+        page.pack_start(new_btn, False, False, 0)
+
+        # Coller presse-papier dans la VM courante.
+        paste_btn = Gtk.Button()
+        paste_btn.get_style_context().add_class("menu-item")
+        paste_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        paste_lbl = Gtk.Label(
+            label="📋  Coller le presse-papier dans la VM", xalign=0)
+        paste_lbl.set_hexpand(True)
+        paste_kbd = Gtk.Label(label="Ctrl  Shift  V")
+        paste_kbd.get_style_context().add_class("kbd")
+        paste_row.pack_start(paste_lbl, True, True, 0)
+        paste_row.pack_end(paste_kbd, False, False, 0)
+        paste_btn.add(paste_row)
+        paste_btn.connect(
+            "clicked", lambda *_: self._paste_clipboard_into_vm())
+        page.pack_start(paste_btn, False, False, 0)
+        return page
+
+    def _build_tab_infos(self):
+        """Onglet Infos : grille des détails de la session courante."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        if self._current is None:
+            empty = Gtk.Label(
+                label="\nAucune session sélectionnée.", xalign=0)
+            empty.get_style_context().add_class("form-sub")
+            page.pack_start(empty, False, False, 0)
+            return page
+
+        grid = Gtk.Grid()
+        grid.set_column_spacing(14); grid.set_row_spacing(4)
+        grid.set_margin_start(4); grid.set_margin_top(2)
+        grid.set_margin_bottom(4)
+
+        def _add(row, label, value, value_class=None):
+            k = Gtk.Label(label=label, xalign=0)
+            k.get_style_context().add_class("form-sub")
+            v = Gtk.Label(label=value, xalign=0)
+            v.set_selectable(True)
+            if value_class:
+                v.get_style_context().add_class(value_class)
+            grid.attach(k, 0, row, 1, 1)
+            grid.attach(v, 1, row, 1, 1)
+
+        s = self._current
+        c = s.conn
+        elapsed = int(time.time() - s.started_at)
+        h, rem = divmod(elapsed, 3600)
+        m, sec = divmod(rem, 60)
+        uptime = (f"{h:02d}:{m:02d}:{sec:02d}" if h
+                  else f"{m:02d}:{sec:02d}")
+        started = datetime.fromtimestamp(
+            s.started_at).strftime("%H:%M:%S")
+
+        self._refresh_latency_async(s)
+        if s.latency_ms is None:
+            lat_str, lat_cls = "mesure…", None
+        else:
+            lat_str = f"{s.latency_ms} ms"
+            lat_cls = ("kpi-good" if s.latency_ms < 30
+                       else "kpi-warn" if s.latency_ms < 80
+                       else "kpi-bad")
+
+        running = (s.proc is not None and s.proc.poll() is None)
+        etat_str = "● Actif" if running else "○ Déconnecté"
+        etat_cls = "kpi-good" if running else "kpi-bad"
+
+        proto = c.get("protocol", "?").upper()
+        os_name = (c.get("os") or "—").capitalize()
+
+        _add(0, "État",        etat_str, etat_cls)
+        _add(1, "Protocole",   f"{proto}  ·  {os_name}")
+        _add(2, "Hôte",        f"{c.get('host','')}:{c.get('port','')}")
+        _add(3, "Utilisateur", c.get("user", "—"))
+        _add(4, "Ouverte à",   started)
+        _add(5, "Durée",       uptime)
+        _add(6, "Latence",     lat_str, lat_cls)
+
+        if proto == "RDP":
+            disp = Gdk.Display.get_default()
+            mon = disp.get_primary_monitor() or disp.get_monitor(0)
+            geo = mon.get_geometry()
+            gpu_v = (HW_INFO.get("gpu_vendor") or "aucun").upper()
+            gpu_ok = HW_INFO.get("gpu_accel")
+            gpu_str = (f"{gpu_v} (accélération)" if gpu_ok
+                       else f"{gpu_v} (CPU only)")
+            if self._perf_profile == "gamer":
+                if gpu_ok:
+                    mode_str = "🎮 Gamer  ·  H.264 + RemoteFX (GPU)"
+                    aff_str  = f"{geo.width}×{geo.height}  ·  AVC420 32 bpp"
+                else:
+                    mode_str = "🎮 Gamer  ·  RemoteFX léger (CPU)"
+                    aff_str  = f"{geo.width}×{geo.height}  ·  RFX 16 bpp"
+                aud_str = "Pulse  ·  faible latence"
+            else:
+                if gpu_ok:
+                    mode_str = "🌙 Tranquille  ·  qualité max (GPU)"
+                    aff_str  = f"{geo.width}×{geo.height}  ·  AVC444 32 bpp"
+                else:
+                    mode_str = "🌙 Tranquille  ·  qualité (CPU)"
+                    aff_str  = f"{geo.width}×{geo.height}  ·  RFX 32 bpp"
+                aud_str = "Pulse  ·  micro activé"
+            _add(7,  "Mode",       mode_str)
+            _add(8,  "Affichage",  aff_str)
+            _add(9,  "Audio",      aud_str)
+            _add(10, "Matériel",   gpu_str)
+            _add(11, "Partages",
+                 "Presse-papiers · /home · imprimantes · USB · carte à puce")
+            _add(12, "Reconnexion", "auto (5 essais)")
+
+        page.pack_start(grid, False, False, 0)
+        return page
+
+    def _build_tab_outils(self):
+        """Onglet Outils : Mon PC + presse-papier histo + speedtest +
+        dictée + masquage."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        host_btn = Gtk.Button()
+        host_btn.get_style_context().add_class("menu-item")
+        host_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        host_lbl = Gtk.Label(
+            label="💻  Mon PC (batterie, luminosité, volume…)",
+            xalign=0)
+        host_lbl.set_hexpand(True)
+        host_row.pack_start(host_lbl, True, True, 0)
+        host_btn.add(host_row)
+        host_btn.connect("clicked", lambda *_: self._open_host_panel())
+        page.pack_start(host_btn, False, False, 0)
+
+        if self._current is None:
+            return page
+
+        def _mk_tool(label, tip, cb, kbd=None):
+            b = Gtk.Button()
+            b.get_style_context().add_class("menu-item")
+            row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+            lbl = Gtk.Label(label=label, xalign=0)
+            lbl.set_hexpand(True)
+            row.pack_start(lbl, True, True, 0)
+            if kbd:
+                k = Gtk.Label(label=kbd)
+                k.get_style_context().add_class("kbd")
+                row.pack_end(k, False, False, 0)
+            b.add(row)
+            b.set_tooltip_text(tip)
+            b.connect("clicked", lambda *_: cb())
+            return b
+
+        page.pack_start(_mk_tool(
+            f"📚  Historique presse-papier  "
+            f"({len(CLIP_HISTORY.items())})",
+            "Affiche les 10 derniers textes copiés et permet de les "
+            "recoller dans la VM.",
+            self._open_clip_history_popup), False, False, 0)
+
+        page.pack_start(_mk_tool(
+            "🚀  Tester ma connexion vers cette VM",
+            "Mesure ping ICMP + latence TCP, donne un verdict.",
+            self._open_speedtest_popup), False, False, 0)
+
+        stt_lbl = ("🎙  Dictée vocale (parle à la VM)"
+                   if stt_available()
+                   else "🎙  Dictée vocale (whisper non installé)")
+        page.pack_start(_mk_tool(
+            stt_lbl,
+            "Enregistre 6 secondes et tape le texte transcrit "
+            "dans la VM. Nécessite whisper / whisper.cpp.",
+            self._start_dictation_ui, kbd="F12"), False, False, 0)
+
+        page.pack_start(_mk_tool(
+            "🛡  Masquer l'écran (quelqu'un arrive)",
+            "Couvre instantanément toutes les VM avec un fond neutre.",
+            self._panic_mask, kbd="Ctrl  Shift  H"), False, False, 0)
+
+        return page
+
+    def _build_tab_perf(self):
+        """Onglet Perf : mode RDP + auto-diagnostic."""
+        page = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+
+        hdr_p = Gtk.Label(label="MODE DE PERFORMANCE", xalign=0)
+        hdr_p.get_style_context().add_class("nav-section")
+        page.pack_start(hdr_p, False, False, 0)
+
+        prow = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        prow.set_margin_start(4); prow.set_margin_end(4)
+
+        def _mk_profile_btn(name, label, sublabel):
+            b = Gtk.Button()
+            b.get_style_context().add_class("chip")
+            if self._perf_profile == name:
+                b.get_style_context().add_class("chip-active")
+            v = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            t = Gtk.Label(label=label, xalign=0.5)
+            t.get_style_context().add_class("form-title")
+            d = Gtk.Label(label=sublabel, xalign=0.5)
+            d.get_style_context().add_class("form-sub")
+            v.pack_start(t, False, False, 0)
+            v.pack_start(d, False, False, 0)
+            b.add(v)
+            b.connect(
+                "button-press-event",
+                lambda *_: (self._set_profile(name), True)[1])
+            return b
+
+        prow.pack_start(_mk_profile_btn(
+            "tranquille", "🌙  Tranquille",
+            "Qualité max · audio HD · micro"), True, True, 0)
+        prow.pack_start(_mk_profile_btn(
+            "gamer", "🎮  Gamer",
+            "Fluidité max · 16 bpp · micro coupé"), True, True, 0)
+        page.pack_start(prow, False, False, 0)
+
+        hint = Gtk.Label(
+            label="Le changement relance la session RDP active.",
+            xalign=0)
+        hint.get_style_context().add_class("form-sub")
+        hint.set_margin_top(2)
+        page.pack_start(hint, False, False, 0)
+
+        # Auto-diagnostic.
+        try:
+            diag = DIAG
+        except NameError:
+            diag = None
+        if diag and diag["results"]:
+            sep_d = Gtk.Separator(
+                orientation=Gtk.Orientation.HORIZONTAL)
+            sep_d.set_margin_top(8); sep_d.set_margin_bottom(6)
+            page.pack_start(sep_d, False, False, 0)
+
+            hdr_d = Gtk.Label(
+                label=f"AUTO-DIAGNOSTIC  ·  {diag['ok']} OK · "
+                      f"{diag['warn']} ⚠  ·  {diag['fail']} ✗",
+                xalign=0)
+            hdr_d.get_style_context().add_class("nav-section")
+            page.pack_start(hdr_d, False, False, 0)
+
+            shown = [r for r in diag["results"]
+                     if r[0] in ("FAIL", "WARN")]
+            if not shown:
+                shown = [("OK",
+                          "Toutes les vérifications sont passées", "")]
+
+            for level, label_, detail in shown[:8]:
+                line = Gtk.Label(xalign=0)
+                line.set_line_wrap(True)
+                icon = {"OK": "✅", "WARN": "⚠", "FAIL": "✗"}[level]
+                txt = (f"{icon}  "
+                       f"<b>{GLib.markup_escape_text(label_)}</b>")
+                if detail:
+                    txt += (f"  <span alpha='65%'>· "
+                            f"{GLib.markup_escape_text(detail)}</span>")
+                line.set_markup(txt)
+                cls = {"OK": "kpi-good", "WARN": "kpi-warn",
+                       "FAIL": "kpi-bad"}[level]
+                line.get_style_context().add_class(cls)
+                page.pack_start(line, False, False, 0)
+        return page
 
     def _on_session_click(self, s):
         if s is not self._current:

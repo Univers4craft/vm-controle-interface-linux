@@ -357,3 +357,21 @@ stack { background: transparent; }
 .panic-mask label { color: #cbd5e1; }
 .panic-clock { color: #ffffff; }
 .panic-body  { color: #94a3b8; }
+
+/* Onglets du menu Échap (Sessions / Infos / Outils / Perf) */
+.menu-tab {
+  padding: 6px 10px;
+  font-size: 0.95em;
+  border-radius: 10px;
+}
+.menu-tab label { color: #cbd5e1; }
+.menu-tab.chip-active label { color: #ffffff; }
+.nav-badge {
+  background: #4f46e5;
+  color: #ffffff;
+  border-radius: 10px;
+  padding: 0px 6px;
+  font-size: 0.78em;
+  font-weight: 700;
+  min-width: 16px;
+}
