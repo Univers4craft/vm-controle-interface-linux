@@ -4069,10 +4069,14 @@ class VMShell(Gtk.Window):
         logout_btn.get_style_context().add_class("chip")
         logout_btn.connect("clicked", lambda *_: self._on_logout())
 
-        shutdown_btn = Gtk.Button(label="⏼  Éteindre")
+        shutdown_btn = Gtk.Button(label="⏼  Alimentation")
         shutdown_btn.get_style_context().add_class("chip")
         shutdown_btn.get_style_context().add_class("chip-danger")
-        shutdown_btn.connect("clicked", lambda *_: self._on_shutdown())
+        shutdown_btn.set_tooltip_text(
+            "Veille, hibernation, redémarrage, extinction, "
+            "déconnexion ou quitter VMShell.")
+        shutdown_btn.connect("clicked",
+                             lambda *_: self._open_power_menu())
 
         head.pack_start(logout_btn, False, False, 0)
         head.pack_start(shutdown_btn, False, False, 0)
@@ -5019,6 +5023,219 @@ class VMShell(Gtk.Window):
             except (OSError, FileNotFoundError):
                 continue
         self._toast("Extinction impossible.")
+
+    # ---- Menu Alimentation -------------------------------------------
+    def _try_cmds(self, cmds, fail_msg):
+        """Lance la 1re commande dispo dans la liste. Retourne True
+        en cas de succès. Toaste en cas d'échec total."""
+        for cmd in cmds:
+            try:
+                subprocess.Popen(cmd)
+                return True
+            except (OSError, FileNotFoundError):
+                continue
+        self._toast(fail_msg)
+        return False
+
+    def _on_suspend(self):
+        # Mise en veille : pas de confirmation (action non destructive).
+        self._try_cmds(
+            [["systemctl", "suspend"],
+             ["pkexec", "systemctl", "suspend"],
+             ["loginctl", "suspend"]],
+            "Mise en veille impossible.")
+
+    def _on_hibernate(self):
+        if not self._confirm(
+                "Hiberner (mémoire écrite sur disque) ?"):
+            return
+        self._try_cmds(
+            [["systemctl", "hibernate"],
+             ["pkexec", "systemctl", "hibernate"],
+             ["loginctl", "hibernate"]],
+            "Hibernation indisponible sur ce système.")
+
+    def _on_reboot(self):
+        if not self._confirm("Redémarrer l'ordinateur ?"):
+            return
+        self._try_cmds(
+            [["systemctl", "reboot"],
+             ["shutdown", "-r", "now"],
+             ["pkexec", "shutdown", "-r", "now"]],
+            "Redémarrage impossible.")
+
+    def _on_quit_vmshell(self):
+        if not self._confirm("Quitter VMShell ?"):
+            return
+        try:
+            Gtk.main_quit()
+        except Exception:
+            os._exit(0)
+
+    def _on_lock_screen(self):
+        # Verrouillage de la session graphique (pas une extinction).
+        self._try_cmds(
+            [["loginctl", "lock-session"],
+             ["xdg-screensaver", "lock"],
+             ["gnome-screensaver-command", "--lock"],
+             ["cinnamon-screensaver-command", "--lock"],
+             ["xset", "s", "activate"]],
+            "Verrouillage indisponible.")
+
+    def _open_power_menu(self):
+        """Popup d'alimentation : veille / verrouiller / hiberner /
+        redémarrer / éteindre / déconnexion / quitter VMShell."""
+        dlg = Gtk.Dialog(
+            title="Alimentation",
+            transient_for=self.get_toplevel(),
+            modal=True)
+        dlg.set_default_size(420, -1)
+        dlg.get_style_context().add_class("vmshell")
+
+        box = dlg.get_content_area()
+        box.set_spacing(8)
+        box.set_margin_top(12)
+        box.set_margin_bottom(12)
+        box.set_margin_start(14)
+        box.set_margin_end(14)
+
+        title = Gtk.Label(
+            label="<b>Que voulez-vous faire ?</b>", xalign=0)
+        title.set_use_markup(True)
+        title.get_style_context().add_class("form-title")
+        box.pack_start(title, False, False, 0)
+
+        # Affiche l'état batterie pour aider à choisir.
+        try:
+            top = self.get_toplevel()
+            pct, status = (None, "")
+            if hasattr(top, "_read_battery_state"):
+                pct, status = top._read_battery_state()
+            sec, mode = estimate_battery_seconds()
+            if pct is not None:
+                charging = (mode == "charge"
+                            or (status and status.lower() == "full"))
+                icon = "🔌" if charging else (
+                    "🔋" if pct > 20 else "🪫")
+                eta = (f"  ·  ≈ {fmt_duration(sec)}"
+                       if sec and not charging else "")
+                hint = Gtk.Label(
+                    label=f"{icon} {pct} %{eta}", xalign=0)
+                hint.get_style_context().add_class("form-sub")
+                box.pack_start(hint, False, False, 0)
+        except Exception:
+            pass
+
+        def _row(emoji, title_txt, desc, css_extra, callback,
+                 enabled=True):
+            btn = Gtk.Button()
+            btn.get_style_context().add_class("power-row")
+            if css_extra:
+                btn.get_style_context().add_class(css_extra)
+            btn.set_sensitive(enabled)
+            inner = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=12)
+            inner.set_margin_top(8)
+            inner.set_margin_bottom(8)
+            inner.set_margin_start(10)
+            inner.set_margin_end(10)
+            ic = Gtk.Label(label=emoji, xalign=0)
+            ic.get_style_context().add_class("power-emoji")
+            txt = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=0)
+            t = Gtk.Label(label=f"<b>{title_txt}</b>", xalign=0)
+            t.set_use_markup(True)
+            d = Gtk.Label(label=desc, xalign=0)
+            d.get_style_context().add_class("form-sub")
+            d.set_line_wrap(True)
+            txt.pack_start(t, False, False, 0)
+            txt.pack_start(d, False, False, 0)
+            inner.pack_start(ic, False, False, 0)
+            inner.pack_start(txt, True, True, 0)
+            btn.add(inner)
+
+            def _go(_w):
+                dlg.response(Gtk.ResponseType.OK)
+                GLib.idle_add(callback)
+            btn.connect("clicked", _go)
+            return btn
+
+        # Détecte support hibernate.
+        hib_ok = True
+        try:
+            r = subprocess.run(
+                ["systemctl", "hibernate", "--dry-run"],
+                capture_output=True, text=True, timeout=2)
+            hib_ok = (r.returncode == 0)
+        except Exception:
+            hib_ok = os.path.exists("/sys/power/disk")
+
+        sessions_open = (len(getattr(self, "_sessions", []) or []) > 0)
+        warn_suffix = ("  ⚠ Sessions VM ouvertes !"
+                       if sessions_open else "")
+
+        box.pack_start(_row(
+            "🌙", "Veille",
+            "Suspend l'ordinateur. Reprise instantanée." + warn_suffix,
+            None, self._on_suspend), False, False, 0)
+
+        box.pack_start(_row(
+            "🔒", "Verrouiller",
+            "Verrouille la session sans rien fermer.",
+            None, self._on_lock_screen), False, False, 0)
+
+        box.pack_start(_row(
+            "💤", "Hibernation",
+            ("Écrit la RAM sur disque puis éteint. Reprise lente."
+             if hib_ok else
+             "Indisponible sur ce système (pas de swap suffisant)."),
+            None, self._on_hibernate, enabled=hib_ok),
+            False, False, 0)
+
+        box.pack_start(_row(
+            "🔄", "Redémarrer",
+            "Ferme tout et redémarre l'ordinateur." + warn_suffix,
+            "power-row-warn", self._on_reboot), False, False, 0)
+
+        box.pack_start(_row(
+            "⏼", "Éteindre",
+            "Ferme tout et éteint l'ordinateur." + warn_suffix,
+            "power-row-danger", self._on_shutdown), False, False, 0)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(4)
+        sep.set_margin_bottom(4)
+        box.pack_start(sep, False, False, 0)
+
+        box.pack_start(_row(
+            "↪", "Déconnexion",
+            "Ferme la session graphique et revient à l'écran "
+            "de connexion.",
+            None, self._on_logout), False, False, 0)
+
+        box.pack_start(_row(
+            "✖", "Quitter VMShell",
+            "Ferme uniquement VMShell (l'ordinateur reste allumé).",
+            None, self._on_quit_vmshell), False, False, 0)
+
+        # Bouton Annuler discret.
+        cancel = Gtk.Button(label="Annuler")
+        cancel.get_style_context().add_class("chip")
+        cancel.connect(
+            "clicked",
+            lambda *_: dlg.response(Gtk.ResponseType.CANCEL))
+        bb = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=0)
+        bb.set_halign(Gtk.Align.END)
+        bb.set_margin_top(6)
+        bb.pack_start(cancel, False, False, 0)
+        box.pack_start(bb, False, False, 0)
+
+        dlg.show_all()
+        try:
+            dlg.run()
+        finally:
+            dlg.destroy()
 
     def _on_search(self, entry):
         self._filter = entry.get_text()

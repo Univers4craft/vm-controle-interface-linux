@@ -395,3 +395,31 @@ stack { background: transparent; }
 .quick-chip:hover {
   background: rgba(255,255,255,0.06);
 }
+
+/* Menu Alimentation : lignes cliquables pleine largeur */
+.power-row {
+  background: rgba(255,255,255,0.04);
+  border: 1px solid rgba(255,255,255,0.08);
+  border-radius: 10px;
+  padding: 0;
+  transition: all 0.15s ease;
+}
+.power-row:hover {
+  background: rgba(127,90,240,0.18);
+  border-color: rgba(127,90,240,0.55);
+}
+.power-row:disabled {
+  opacity: 0.45;
+}
+.power-row-warn:hover {
+  background: rgba(255,176,46,0.22);
+  border-color: rgba(255,176,46,0.65);
+}
+.power-row-danger:hover {
+  background: rgba(255,72,96,0.22);
+  border-color: rgba(255,72,96,0.7);
+}
+.power-emoji {
+  font-size: 1.6em;
+  min-width: 32px;
+}
