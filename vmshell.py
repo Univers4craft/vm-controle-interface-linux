@@ -351,6 +351,150 @@ def new_conn(name="", protocol="rdp", host="", port=None, user="",
         "maintenance": False,
     }
 
+
+# ---------------------------------------------------------------------------
+# Calcul des réglages perf RDP — fonctions de module, partagées entre
+# ConsolePage._start_rdp (lance la commande) et VMShell._build_rdp_perf_panel
+# (UI). Détaché des classes pour que ConsolePage puisse y accéder sans
+# référence à VMShell.
+# ---------------------------------------------------------------------------
+
+# Détectée une fois par VMShell._detect_chrt_capability et lue par
+# rdp_wrap_realtime.
+RT_CHRT_OK = False
+
+
+def rdp_compute_perf(profile, hw_ok, user):
+    """Calcule les réglages effectifs (codec, réseau, audio…) à partir
+    du profil courant et des surcharges utilisateur."""
+    if profile == "gamer":
+        if hw_ok:
+            d = dict(codec="avc420", network="broadband", bpp="32",
+                     compression="on", frame_ack=2, async_=True,
+                     eye_candy_off=True, audio_lat="40",
+                     audio_q="medium",
+                     realtime=True, clipboard_fast=True)
+        else:
+            d = dict(codec="rfx-image", network="broadband",
+                     bpp="16", compression="on", frame_ack=4,
+                     async_=True, eye_candy_off=True,
+                     audio_lat="60", audio_q="low",
+                     realtime=True, clipboard_fast=True)
+    else:  # tranquille
+        if hw_ok:
+            d = dict(codec="avc444", network="lan", bpp="32",
+                     compression="off", frame_ack=0, async_=False,
+                     eye_candy_off=False, audio_lat="",
+                     audio_q="medium",
+                     realtime=False, clipboard_fast=True)
+        else:
+            d = dict(codec="rfx", network="lan", bpp="32",
+                     compression="on", frame_ack=0, async_=False,
+                     eye_candy_off=False, audio_lat="",
+                     audio_q="medium",
+                     realtime=False, clipboard_fast=True)
+
+    if user.get("rdp_ultra_latency"):
+        d.update(
+            codec=("avc420" if hw_ok else "rfx-image"),
+            network="autodetect", bpp="16",
+            compression="on", frame_ack=1, async_=True,
+            eye_candy_off=True, audio_lat="20", audio_q="low",
+            realtime=True, clipboard_fast=True)
+
+    v = user.get("rdp_codec", "auto")
+    if v in ("avc444", "avc420", "rfx", "rfx-image"):
+        d["codec"] = v
+    v = user.get("rdp_network", "auto")
+    if v in ("lan", "broadband", "wan", "modem", "autodetect"):
+        d["network"] = v
+    v = user.get("rdp_bpp", "auto")
+    if v in ("32", "24", "16", "8"):
+        d["bpp"] = v
+    v = user.get("rdp_compression", "auto")
+    if v in ("on", "off"):
+        d["compression"] = v
+    try:
+        fa = int(user.get("rdp_frame_ack", 0))
+        if fa > 0:
+            d["frame_ack"] = fa
+    except (TypeError, ValueError):
+        pass
+    if "rdp_async" in user:
+        d["async_"] = bool(user["rdp_async"])
+    ec = user.get("rdp_disable_eye_candy", "auto")
+    if ec in ("on", "off"):
+        d["eye_candy_off"] = (ec == "on")
+    al = user.get("rdp_audio_latency", "auto")
+    if al == "off":
+        d["audio_lat"] = "off"
+    elif al in ("20", "40", "60"):
+        d["audio_lat"] = al
+        d["audio_q"] = "low" if int(al) <= 30 else "medium"
+    elif al == "full":
+        d["audio_lat"] = ""
+    rt = user.get("rdp_realtime", "auto")
+    if rt in ("on", "off"):
+        d["realtime"] = (rt == "on")
+    cf = user.get("rdp_clipboard_fast", "auto")
+    if cf in ("on", "off"):
+        d["clipboard_fast"] = (cf == "on")
+    return d
+
+
+def rdp_emit_perf_args(p):
+    """Convertit le dict de réglages en arguments xfreerdp."""
+    args = [f"/network:{p['network']}", f"/bpp:{p['bpp']}"]
+    if p.get("clipboard_fast"):
+        args.append("/clipboard:use-selection")
+    else:
+        args.append("+clipboard")
+    c = p.get("codec")
+    if c == "avc444":
+        args.append("/gfx:AVC444:on,progressive:on")
+    elif c == "avc420":
+        args += ["/gfx:AVC420:on,progressive:on",
+                 "+rfx", "/rfx-mode:video"]
+    elif c == "rfx":
+        args.append("+rfx")
+    elif c == "rfx-image":
+        args += ["+rfx", "/rfx-mode:image"]
+    args.append("+compression" if p.get("compression") == "on"
+                else "-compression")
+    if p.get("frame_ack"):
+        args.append(f"/frame-ack:{p['frame_ack']}")
+    if p.get("async_"):
+        args += ["+async-update", "+async-channels"]
+    if p.get("eye_candy_off"):
+        args += ["-wallpaper", "-themes", "-aero",
+                 "-menu-anims", "-window-drag", "-fonts"]
+    al = p.get("audio_lat")
+    if al == "off":
+        args.append("/sound:off")
+    elif al:
+        q = p.get("audio_q") or "medium"
+        args.append(f"/sound:sys:pulse,quality:{q},latency:{al}")
+    else:
+        args.append("/sound:sys:pulse")
+    return args
+
+
+def rdp_wrap_realtime(cmd, perf):
+    """Préfixe la commande xfreerdp avec taskset + chrt si possible."""
+    if not perf.get("realtime"):
+        return cmd
+    prefix = []
+    try:
+        ncpu = os.cpu_count() or 1
+    except Exception:
+        ncpu = 1
+    if shutil.which("taskset") and ncpu >= 4:
+        prefix += ["taskset", "-c", "2,3"]
+    if RT_CHRT_OK and shutil.which("chrt"):
+        prefix += ["chrt", "-r", "10"]
+    return prefix + cmd if prefix else cmd
+
+
 # ---------------------------------------------------------------------------
 # Connection dialog
 # ---------------------------------------------------------------------------
@@ -2906,8 +3050,8 @@ echo OK
             # (cf. panneau "Performance & Latence" dans Paramètres).
             hw_ok = bool(HW_INFO.get("gpu_accel"))
             user = load_json(SETTINGS_FILE, {}) or {}
-            perf = self._compute_rdp_perf(profile, hw_ok, user)
-            cmd += self._emit_rdp_perf_args(perf)
+            perf = rdp_compute_perf(profile, hw_ok, user)
+            cmd += rdp_emit_perf_args(perf)
             # Micro : uniquement en mode tranquille (gamer fige l'audio
             # pour la bande passante upload).
             if (profile == "tranquille"
@@ -2918,7 +3062,7 @@ echo OK
             if conn.get("password"):
                 cmd.append(f"/p:{conn['password']}")
             # Préfixe temps-réel (taskset + chrt) si dispo et activé.
-            launch_cmd = self._wrap_realtime(cmd, perf)
+            launch_cmd = rdp_wrap_realtime(cmd, perf)
             try:
                 s.proc = subprocess.Popen(launch_cmd)
                 log_session("start", conn)
@@ -4193,166 +4337,56 @@ class VMShell(Gtk.Window):
         return b
 
     def _compute_rdp_perf(self, profile, hw_ok, user):
-        """Calcule les réglages effectifs (codec, réseau, audio…) à partir
-        du profil courant et des surcharges utilisateur stockées dans
-        settings.json. Voir _build_rdp_perf_panel."""
-        # --- 1) défauts profil ---
-        if profile == "gamer":
-            if hw_ok:
-                d = dict(codec="avc420", network="broadband", bpp="32",
-                         compression="on", frame_ack=2, async_=True,
-                         eye_candy_off=True, audio_lat="40",
-                         audio_q="medium",
-                         realtime=True, clipboard_fast=True)
-            else:
-                d = dict(codec="rfx-image", network="broadband",
-                         bpp="16", compression="on", frame_ack=4,
-                         async_=True, eye_candy_off=True,
-                         audio_lat="60", audio_q="low",
-                         realtime=True, clipboard_fast=True)
-        else:  # tranquille
-            if hw_ok:
-                d = dict(codec="avc444", network="lan", bpp="32",
-                         compression="off", frame_ack=0, async_=False,
-                         eye_candy_off=False, audio_lat="",
-                         audio_q="medium",
-                         realtime=False, clipboard_fast=True)
-            else:
-                d = dict(codec="rfx", network="lan", bpp="32",
-                         compression="on", frame_ack=0, async_=False,
-                         eye_candy_off=False, audio_lat="",
-                         audio_q="medium",
-                         realtime=False, clipboard_fast=True)
-
-        # --- 2) préset "Ultra-latence" (<20 ms visé) ---
-        if user.get("rdp_ultra_latency"):
-            d.update(
-                codec=("avc420" if hw_ok else "rfx-image"),
-                network="autodetect", bpp="16",
-                compression="on", frame_ack=1, async_=True,
-                eye_candy_off=True, audio_lat="20", audio_q="low",
-                realtime=True, clipboard_fast=True)
-
-        # --- 3) surcharges utilisateur (non-"auto") ---
-        v = user.get("rdp_codec", "auto")
-        if v in ("avc444", "avc420", "rfx", "rfx-image"):
-            d["codec"] = v
-        v = user.get("rdp_network", "auto")
-        if v in ("lan", "broadband", "wan", "modem", "autodetect"):
-            d["network"] = v
-        v = user.get("rdp_bpp", "auto")
-        if v in ("32", "24", "16", "8"):
-            d["bpp"] = v
-        v = user.get("rdp_compression", "auto")
-        if v in ("on", "off"):
-            d["compression"] = v
-        try:
-            fa = int(user.get("rdp_frame_ack", 0))
-            if fa > 0:
-                d["frame_ack"] = fa
-        except (TypeError, ValueError):
-            pass
-        if "rdp_async" in user:
-            d["async_"] = bool(user["rdp_async"])
-        ec = user.get("rdp_disable_eye_candy", "auto")
-        if ec in ("on", "off"):
-            d["eye_candy_off"] = (ec == "on")
-        al = user.get("rdp_audio_latency", "auto")
-        if al == "off":
-            d["audio_lat"] = "off"
-        elif al in ("20", "40", "60"):
-            d["audio_lat"] = al
-            d["audio_q"] = "low" if int(al) <= 30 else "medium"
-        elif al == "full":
-            d["audio_lat"] = ""
-        # realtime / clipboard-fast overrides (auto = on/off du profil)
-        rt = user.get("rdp_realtime", "auto")
-        if rt in ("on", "off"):
-            d["realtime"] = (rt == "on")
-        cf = user.get("rdp_clipboard_fast", "auto")
-        if cf in ("on", "off"):
-            d["clipboard_fast"] = (cf == "on")
-        return d
+        """Délègue à la fonction module (partagée avec ConsolePage)."""
+        return rdp_compute_perf(profile, hw_ok, user)
 
     def _emit_rdp_perf_args(self, p):
-        """Convertit le dict de réglages en arguments xfreerdp."""
-        args = [f"/network:{p['network']}", f"/bpp:{p['bpp']}"]
-        # Presse-papier rapide (sélection X11 + clipboard CLIPBOARD).
-        if p.get("clipboard_fast"):
-            args.append("/clipboard:use-selection")
-        else:
-            args.append("+clipboard")
-        c = p.get("codec")
-        if c == "avc444":
-            args.append("/gfx:AVC444:on,progressive:on")
-        elif c == "avc420":
-            args += ["/gfx:AVC420:on,progressive:on",
-                     "+rfx", "/rfx-mode:video"]
-        elif c == "rfx":
-            args.append("+rfx")
-        elif c == "rfx-image":
-            args += ["+rfx", "/rfx-mode:image"]
-        args.append("+compression" if p.get("compression") == "on"
-                    else "-compression")
-        if p.get("frame_ack"):
-            args.append(f"/frame-ack:{p['frame_ack']}")
-        if p.get("async_"):
-            args += ["+async-update", "+async-channels"]
-        if p.get("eye_candy_off"):
-            args += ["-wallpaper", "-themes", "-aero",
-                     "-menu-anims", "-window-drag", "-fonts"]
-        al = p.get("audio_lat")
-        if al == "off":
-            args.append("/sound:off")
-        elif al:
-            q = p.get("audio_q") or "medium"
-            args.append(f"/sound:sys:pulse,quality:{q},latency:{al}")
-        else:
-            args.append("/sound:sys:pulse")
-        return args
+        return rdp_emit_perf_args(p)
 
     def _wrap_realtime(self, cmd, perf):
-        """Préfixe la commande xfreerdp avec taskset + chrt si dispo et
-        si le profil le demande (réduit le jitter d'ordonnancement)."""
-        if not perf.get("realtime"):
-            return cmd
-        prefix = []
-        # Affinité : cœurs 2,3 (évite les E-cores Intel et les cœurs 0,1
-        # surchargés par le compositeur). Best-effort si >= 4 cœurs.
-        try:
-            ncpu = os.cpu_count() or 1
-        except Exception:
-            ncpu = 1
-        if shutil.which("taskset") and ncpu >= 4:
-            prefix += ["taskset", "-c", "2,3"]
-        # Priorité temps-réel SCHED_RR : nécessite CAP_SYS_NICE. On
-        # teste une fois au démarrage (_rt_chrt_ok) ; si KO on n'ajoute
-        # rien plutôt que de risquer "Operation not permitted" qui ferait
-        # échouer le lancement entier.
-        if getattr(self, "_rt_chrt_ok", False) and shutil.which("chrt"):
-            prefix += ["chrt", "-r", "10"]
-        return prefix + cmd if prefix else cmd
+        return rdp_wrap_realtime(cmd, perf)
 
     def _detect_chrt_capability(self):
         """Vérifie une fois si on peut utiliser chrt -r (CAP_SYS_NICE).
-        Si non, on ne l'inclura jamais dans le préfixe temps-réel pour
-        éviter d'échouer le lancement de xfreerdp."""
+        Met à jour RT_CHRT_OK pour que rdp_wrap_realtime (module) puisse
+        décider sans référence à VMShell."""
+        global RT_CHRT_OK
+        # Vérif 1 : RLIMIT_RTPRIO. Si 0, aucune priorité RT possible
+        # (cas par défaut sur la plupart des distros sans config
+        # /etc/security/limits.conf dédiée).
+        try:
+            import resource
+            soft, _hard = resource.getrlimit(resource.RLIMIT_RTPRIO)
+            if soft < 10:
+                RT_CHRT_OK = False
+                print(f"[vmshell] chrt -r indispo "
+                      f"(RLIMIT_RTPRIO={soft}, requiert >=10).",
+                      flush=True)
+                return False
+        except (ImportError, ValueError, OSError):
+            pass
         if not shutil.which("chrt"):
+            RT_CHRT_OK = False
             return False
+        # Vérif 2 : exécution réelle avec stderr capturé.
         try:
             r = subprocess.run(
                 ["chrt", "-r", "10", "true"],
-                capture_output=True, timeout=2)
-            ok = (r.returncode == 0)
+                capture_output=True, text=True, timeout=2)
+            ok = (r.returncode == 0
+                  and "non permise" not in (r.stderr or "")
+                  and "not permitted" not in (r.stderr or "").lower())
+            RT_CHRT_OK = ok
             if ok:
                 print("[vmshell] chrt -r dispo (temps-réel actif).",
                       flush=True)
             else:
                 print("[vmshell] chrt -r indispo "
-                      "(CAP_SYS_NICE manquant) — fallback nice.",
+                      "(CAP_SYS_NICE manquant).",
                       flush=True)
             return ok
         except (subprocess.SubprocessError, OSError):
+            RT_CHRT_OK = False
             return False
 
     def _prewarm_xfreerdp_once(self):
