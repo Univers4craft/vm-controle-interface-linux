@@ -446,7 +446,11 @@ def rdp_emit_perf_args(p):
     """Convertit le dict de réglages en arguments xfreerdp."""
     args = [f"/network:{p['network']}", f"/bpp:{p['bpp']}"]
     if p.get("clipboard_fast"):
-        args.append("/clipboard:use-selection")
+        # xfreerdp3 attend un atom : CLIPBOARD (défaut) ou PRIMARY.
+        # On reste sur CLIPBOARD qui est la sélection standard X11
+        # utilisée par Ctrl+C/Ctrl+V — PRIMARY casserait la copie
+        # avec applications GTK/Qt.
+        args.append("/clipboard:use-selection:CLIPBOARD")
     else:
         args.append("+clipboard")
     c = p.get("codec")
