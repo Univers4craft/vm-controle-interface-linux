@@ -2898,57 +2898,18 @@ echo OK
                         f"(VM affichée sur le primaire).", flush=True)
             except Exception:
                 pass
-            if profile == "gamer":
-                hw_ok = bool(HW_INFO.get("gpu_accel"))
-                if hw_ok:
-                    # GPU dispo → H.264 progressif + RemoteFX vidéo (décodage assisté).
-                    # Pas de "thin-client:on" : il coalesce les frames et
-                    # rend la sélection au clic gauche saccadée.
-                    cmd += ["/network:broadband",
-                            "/bpp:32",
-                            "/gfx:AVC420:on,progressive:on",
-                            "+rfx",
-                            "/rfx-mode:video",
-                            "+compression",
-                            "+async-update",
-                            "+async-channels",
-                            "/frame-ack:2",
-                            "/sound:sys:pulse,quality:medium,latency:40",
-                            "-wallpaper", "-themes", "-aero",
-                            "-menu-anims", "-window-drag", "-fonts"]
-                else:
-                    # Pas de GPU → décodage CPU uniquement, on allège tout :
-                    # RemoteFX seul (codec optimisé CPU), 16 bpp, sans AVC.
-                    cmd += ["/network:broadband",
-                            "/bpp:16",
-                            "+rfx",
-                            "/rfx-mode:image",
-                            "+compression",
-                            "+async-update",
-                            "+async-channels",
-                            "/frame-ack:4",
-                            "/sound:sys:pulse,quality:low,latency:60",
-                            "-wallpaper", "-themes", "-aero",
-                            "-menu-anims", "-window-drag", "-fonts",
-                            "-decorations"]
-            else:
-                if HW_INFO.get("gpu_accel"):
-                    # Mode tranquille avec GPU : qualité max, AVC444 32bpp.
-                    cmd += ["/network:lan",
-                            "/bpp:32",
-                            "/gfx:AVC444:on,progressive:on",
-                            "-compression",
-                            "/sound:sys:pulse",
-                            "/microphone:sys:pulse"]
-                else:
-                    # Pas de GPU : on reste qualité confort mais sans AVC444
-                    # (qui sature un CPU modeste). RemoteFX 32bpp suffit.
-                    cmd += ["/network:lan",
-                            "/bpp:32",
-                            "+rfx",
-                            "+compression",
-                            "/sound:sys:pulse",
-                            "/microphone:sys:pulse"]
+            # Options de perf RDP : profil par défaut + surcharges utilisateur
+            # (cf. panneau "Performance & Latence" dans Paramètres).
+            hw_ok = bool(HW_INFO.get("gpu_accel"))
+            user = load_json(SETTINGS_FILE, {}) or {}
+            perf = self._compute_rdp_perf(profile, hw_ok, user)
+            cmd += self._emit_rdp_perf_args(perf)
+            # Micro : uniquement en mode tranquille (gamer fige l'audio
+            # pour la bande passante upload).
+            if (profile == "tranquille"
+                    and perf.get("audio_lat") != "off"
+                    and not user.get("rdp_ultra_latency")):
+                cmd.append("/microphone:sys:pulse")
             cmd.append(f"/parent-window:{xid}")
             if conn.get("password"):
                 cmd.append(f"/p:{conn['password']}")
@@ -4200,6 +4161,108 @@ class VMShell(Gtk.Window):
             b.pack_start(w, False, False, 0)
         return b
 
+    def _compute_rdp_perf(self, profile, hw_ok, user):
+        """Calcule les réglages effectifs (codec, réseau, audio…) à partir
+        du profil courant et des surcharges utilisateur stockées dans
+        settings.json. Voir _build_rdp_perf_panel."""
+        # --- 1) défauts profil ---
+        if profile == "gamer":
+            if hw_ok:
+                d = dict(codec="avc420", network="broadband", bpp="32",
+                         compression="on", frame_ack=2, async_=True,
+                         eye_candy_off=True, audio_lat="40",
+                         audio_q="medium")
+            else:
+                d = dict(codec="rfx-image", network="broadband",
+                         bpp="16", compression="on", frame_ack=4,
+                         async_=True, eye_candy_off=True,
+                         audio_lat="60", audio_q="low")
+        else:  # tranquille
+            if hw_ok:
+                d = dict(codec="avc444", network="lan", bpp="32",
+                         compression="off", frame_ack=0, async_=False,
+                         eye_candy_off=False, audio_lat="",
+                         audio_q="medium")
+            else:
+                d = dict(codec="rfx", network="lan", bpp="32",
+                         compression="on", frame_ack=0, async_=False,
+                         eye_candy_off=False, audio_lat="",
+                         audio_q="medium")
+
+        # --- 2) préset "Ultra-latence" (<20 ms visé) ---
+        if user.get("rdp_ultra_latency"):
+            d.update(
+                codec=("avc420" if hw_ok else "rfx-image"),
+                network="autodetect", bpp="16",
+                compression="on", frame_ack=1, async_=True,
+                eye_candy_off=True, audio_lat="20", audio_q="low")
+
+        # --- 3) surcharges utilisateur (non-"auto") ---
+        v = user.get("rdp_codec", "auto")
+        if v in ("avc444", "avc420", "rfx", "rfx-image"):
+            d["codec"] = v
+        v = user.get("rdp_network", "auto")
+        if v in ("lan", "broadband", "wan", "modem", "autodetect"):
+            d["network"] = v
+        v = user.get("rdp_bpp", "auto")
+        if v in ("32", "24", "16", "8"):
+            d["bpp"] = v
+        v = user.get("rdp_compression", "auto")
+        if v in ("on", "off"):
+            d["compression"] = v
+        try:
+            fa = int(user.get("rdp_frame_ack", 0))
+            if fa > 0:
+                d["frame_ack"] = fa
+        except (TypeError, ValueError):
+            pass
+        if "rdp_async" in user:
+            d["async_"] = bool(user["rdp_async"])
+        ec = user.get("rdp_disable_eye_candy", "auto")
+        if ec in ("on", "off"):
+            d["eye_candy_off"] = (ec == "on")
+        al = user.get("rdp_audio_latency", "auto")
+        if al == "off":
+            d["audio_lat"] = "off"
+        elif al in ("20", "40", "60"):
+            d["audio_lat"] = al
+            d["audio_q"] = "low" if int(al) <= 30 else "medium"
+        elif al == "full":
+            d["audio_lat"] = ""
+        return d
+
+    def _emit_rdp_perf_args(self, p):
+        """Convertit le dict de réglages en arguments xfreerdp."""
+        args = [f"/network:{p['network']}", f"/bpp:{p['bpp']}"]
+        c = p.get("codec")
+        if c == "avc444":
+            args.append("/gfx:AVC444:on,progressive:on")
+        elif c == "avc420":
+            args += ["/gfx:AVC420:on,progressive:on",
+                     "+rfx", "/rfx-mode:video"]
+        elif c == "rfx":
+            args.append("+rfx")
+        elif c == "rfx-image":
+            args += ["+rfx", "/rfx-mode:image"]
+        args.append("+compression" if p.get("compression") == "on"
+                    else "-compression")
+        if p.get("frame_ack"):
+            args.append(f"/frame-ack:{p['frame_ack']}")
+        if p.get("async_"):
+            args += ["+async-update", "+async-channels"]
+        if p.get("eye_candy_off"):
+            args += ["-wallpaper", "-themes", "-aero",
+                     "-menu-anims", "-window-drag", "-fonts"]
+        al = p.get("audio_lat")
+        if al == "off":
+            args.append("/sound:off")
+        elif al:
+            q = p.get("audio_q") or "medium"
+            args.append(f"/sound:sys:pulse,quality:{q},latency:{al}")
+        else:
+            args.append("/sound:sys:pulse")
+        return args
+
     def _build_rdp_codec_panel(self):
         """Affiche, dans Paramètres, l'état réel de l'encodage RDP :
         codec choisi (AVC444/AVC420/RemoteFX), compression, profondeur,
@@ -4342,6 +4405,250 @@ class VMShell(Gtk.Window):
         box.pack_start(hint, False, False, 4)
         return box
 
+    def _build_rdp_perf_panel(self):
+        """Panneau réglages avancés : codec, réseau, audio, latence.
+
+        Toutes les options sont enregistrées dans settings.json et
+        appliquées à la prochaine connexion (un toast invite à
+        redémarrer la session ouverte si besoin)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(8)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        box.pack_start(sep, False, False, 4)
+
+        hdr = Gtk.Label(label="Performance & Latence (RDP)", xalign=0)
+        hdr.get_style_context().add_class("form-title")
+        box.pack_start(hdr, False, False, 0)
+
+        sub = Gtk.Label(
+            label=("Objectif sous les 20 ms : active le préset "
+                   "« Ultra-latence » ou règle finement les options. "
+                   "S'applique à la prochaine connexion."),
+            xalign=0)
+        sub.set_line_wrap(True)
+        sub.get_style_context().add_class("form-sub")
+        box.pack_start(sub, False, False, 0)
+
+        # ---- chargement settings actuels ----
+        cur = load_json(SETTINGS_FILE, {}) or {}
+
+        def _save(key, value):
+            try:
+                data = load_json(SETTINGS_FILE, {}) or {}
+                data[key] = value
+                save_json_atomic(SETTINGS_FILE, data)
+            except Exception as e:
+                print(f"[vmshell] save perf {key} échoué : {e}",
+                      flush=True)
+            self._toast("Réglage enregistré. Effet à la prochaine "
+                        "connexion.")
+
+        def _row(label_text, widget):
+            r = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            l = Gtk.Label(label=label_text, xalign=0)
+            l.get_style_context().add_class("form-sub")
+            l.set_size_request(220, -1)
+            r.pack_start(l, False, False, 0)
+            r.pack_start(widget, True, True, 0)
+            return r
+
+        def _combo(options, current, key):
+            cb = Gtk.ComboBoxText()
+            for val, lbl in options:
+                cb.append(val, lbl)
+            cb.set_active_id(current if current in [v for v, _ in options]
+                             else options[0][0])
+
+            def _on_change(c):
+                v = c.get_active_id()
+                if v is not None:
+                    _save(key, v)
+            cb.connect("changed", _on_change)
+            return cb
+
+        def _switch(current, key):
+            sw = Gtk.Switch()
+            sw.set_active(bool(current))
+            sw.set_halign(Gtk.Align.START)
+
+            def _on_toggle(s, _state):
+                _save(key, bool(s.get_active()))
+            sw.connect("state-set", _on_toggle)
+            return sw
+
+        # ---- 1) Préset Ultra-latence ----
+        ultra = _switch(cur.get("rdp_ultra_latency", False),
+                        "rdp_ultra_latency")
+        ultra_lbl = Gtk.Label(
+            label="🚀  Ultra-latence (vise <20 ms, qualité réduite)",
+            xalign=0)
+        ultra_lbl.get_style_context().add_class("vm-meta")
+        ultra_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        ultra_row.set_size_request(-1, 30)
+        ultra_row.set_margin_top(4)
+        ultra_row.pack_start(ultra, False, False, 0)
+        ultra_row.pack_start(ultra_lbl, True, True, 6)
+        box.pack_start(ultra_row, False, False, 0)
+
+        # ---- 2) Codec ----
+        box.pack_start(_row("Codec préféré :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("avc444", "H.264 AVC444 — qualité max (LAN, GPU)"),
+            ("avc420", "H.264 AVC420 — équilibré (recommandé latence)"),
+            ("rfx", "RemoteFX — sans H.264"),
+            ("rfx-image", "RemoteFX mode image — CPU léger"),
+        ], cur.get("rdp_codec", "auto"), "rdp_codec")),
+                       False, False, 0)
+
+        # ---- 3) Profil réseau ----
+        box.pack_start(_row("Profil réseau :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("autodetect", "Auto-détection RTT (recommandé)"),
+            ("lan", "LAN — qualité max, peu de compression"),
+            ("broadband", "Haut débit"),
+            ("wan", "WAN — fortes latences"),
+            ("modem", "Modem — très bas débit"),
+        ], cur.get("rdp_network", "auto"), "rdp_network")),
+                       False, False, 0)
+
+        # ---- 4) Profondeur de couleur ----
+        box.pack_start(_row("Profondeur de couleur :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("32", "32 bits — qualité max"),
+            ("24", "24 bits"),
+            ("16", "16 bits — moins de bande passante"),
+            ("8",  "8 bits — minimal"),
+        ], cur.get("rdp_bpp", "auto"), "rdp_bpp")),
+                       False, False, 0)
+
+        # ---- 5) Compression ----
+        box.pack_start(_row("Compression :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("on",  "Activée — moins de débit"),
+            ("off", "Désactivée — LAN ultra-rapide"),
+        ], cur.get("rdp_compression", "auto"), "rdp_compression")),
+                       False, False, 0)
+
+        # ---- 6) Frame-ack (latence des frames) ----
+        box.pack_start(_row("Frame-ack (latence) :", _combo([
+            ("0", "Auto (suit le mode perf)"),
+            ("1", "1 — agressif, plus réactif (recommandé)"),
+            ("2", "2 — équilibré"),
+            ("4", "4 — confort, plus de tampon"),
+            ("8", "8 — très tamponné"),
+        ], str(cur.get("rdp_frame_ack", 0)), "rdp_frame_ack")),
+                       False, False, 0)
+
+        # ---- 7) Async update + channels ----
+        async_sw = _switch(cur.get("rdp_async", True), "rdp_async")
+        box.pack_start(_row("Async update + canaux :", async_sw),
+                       False, False, 0)
+
+        # ---- 8) Effets visuels (eye candy) ----
+        box.pack_start(_row("Désactiver fond/thèmes/anims :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("on",  "Toujours désactivés — moins de trafic"),
+            ("off", "Garder le rendu complet"),
+        ], cur.get("rdp_disable_eye_candy", "auto"),
+            "rdp_disable_eye_candy")),
+                       False, False, 0)
+
+        # ---- 9) Audio (latence) ----
+        box.pack_start(_row("Audio (latence) :", _combo([
+            ("auto", "Auto (suit le mode perf)"),
+            ("20",   "20 ms — minimal, idéal jeux/voix"),
+            ("40",   "40 ms — équilibré"),
+            ("60",   "60 ms — confort réseau lent"),
+            ("full", "Full — qualité max, pas de tampon court"),
+            ("off",  "Coupé — son local seulement"),
+        ], cur.get("rdp_audio_latency", "auto"), "rdp_audio_latency")),
+                       False, False, 0)
+
+        # ---- 10) Test de latence sur la dernière connexion en ligne ----
+        btn_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        btn_row.set_margin_top(8)
+        test_btn = Gtk.Button(
+            label="📡  Tester la latence (1ère VM en ligne)")
+        test_btn.get_style_context().add_class("chip")
+
+        def _on_test(_b):
+            target = None
+            for c in self._connections:
+                if self._status.get(c["id"]) == "online":
+                    target = c
+                    break
+            if not target:
+                self._toast("Aucune VM en ligne.")
+                return
+            test_btn.set_sensitive(False)
+            test_btn.set_label("⏳  Mesure en cours…")
+
+            def _worker():
+                try:
+                    r = speedtest_to(target["host"],
+                                     int(target["port"]),
+                                     timeout=4.0)
+                except Exception as e:
+                    r = {"verdict": f"Erreur : {e}"}
+
+                def _ui():
+                    test_btn.set_sensitive(True)
+                    test_btn.set_label(
+                        "📡  Tester la latence (1ère VM en ligne)")
+                    ping = r.get("ping_ms")
+                    tcp = r.get("tcp_ms")
+                    name = target.get("name", target["host"])
+                    parts = [f"« {name} »"]
+                    if ping is not None:
+                        parts.append(f"ICMP {ping:.1f} ms")
+                    if tcp is not None:
+                        parts.append(f"TCP {tcp:.1f} ms")
+                    parts.append(r.get("verdict", ""))
+                    self._toast(" · ".join(p for p in parts if p))
+                    return False
+                GLib.idle_add(_ui)
+
+            threading.Thread(target=_worker, daemon=True).start()
+
+        test_btn.connect("clicked", _on_test)
+        btn_row.pack_start(test_btn, False, False, 0)
+
+        reset_btn = Gtk.Button(label="↺  Tout remettre en Auto")
+        reset_btn.get_style_context().add_class("chip")
+
+        def _on_reset(_b):
+            try:
+                data = load_json(SETTINGS_FILE, {}) or {}
+                for k in ("rdp_ultra_latency", "rdp_codec",
+                          "rdp_network", "rdp_bpp", "rdp_compression",
+                          "rdp_frame_ack", "rdp_async",
+                          "rdp_disable_eye_candy", "rdp_audio_latency"):
+                    data.pop(k, None)
+                save_json_atomic(SETTINGS_FILE, data)
+                self._toast("Réglages perf remis en Auto. "
+                            "Rouvre Paramètres pour rafraîchir.")
+            except Exception as e:
+                self._toast(f"Erreur : {e}")
+        reset_btn.connect("clicked", _on_reset)
+        btn_row.pack_start(reset_btn, False, False, 0)
+
+        box.pack_start(btn_row, False, False, 0)
+
+        tip = Gtk.Label(
+            label=("ℹ  Conseils <20 ms : Ethernet + même sous-réseau, "
+                   "désactive le Wi-Fi 2,4 GHz, ferme Discord/Spotify, "
+                   "et utilise le préset Ultra-latence ci-dessus."),
+            xalign=0)
+        tip.set_line_wrap(True)
+        tip.get_style_context().add_class("form-sub")
+        box.pack_start(tip, False, False, 4)
+
+        return box
+
     def _build_settings_panel(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         b.get_style_context().add_class("form-card")
@@ -4400,6 +4707,12 @@ class VMShell(Gtk.Window):
             b.pack_start(self._build_rdp_codec_panel(), False, False, 0)
         except Exception as e:
             print(f"[vmshell] codec panel erreur : {e}", flush=True)
+
+        # ---- Réglages avancés perf / latence (codec, réseau, audio…) ----
+        try:
+            b.pack_start(self._build_rdp_perf_panel(), False, False, 0)
+        except Exception as e:
+            print(f"[vmshell] perf panel erreur : {e}", flush=True)
 
         # ---- Auto-démarrage Linux --------------------------------------
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
