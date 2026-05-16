@@ -849,144 +849,186 @@ class ConsolePage(Gtk.Box):
 
     # -- Menu --------------------------------------------------------------
     def _populate_menu(self):
-        """Menu Échap à onglets : Sessions / Infos / Outils / Perf.
-        Réduit la hauteur globale en regroupant les sections dans un
-        Gtk.Stack contrôlé par une rangée de boutons-onglets en haut.
-        L'onglet actif est conservé entre les rebuilds via
-        ``self._menu_active_tab`` (par défaut: 'sessions')."""
+        """Menu Échap minimaliste : seulement les infos essentielles
+        (batterie, ping, mode perf) + le presse-papier. Tout en 1 vue,
+        sans onglet, sans bruit."""
         for c in self._menu_box.get_children():
             self._menu_box.remove(c)
-        if not hasattr(self, "_menu_active_tab"):
-            self._menu_active_tab = "sessions"
         conn = (self._current.conn if self._current else {}) or {}
 
         # ---- En-tête ----------------------------------------------------
-        header = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=0)
-        title = Gtk.Label(label=f"{conn.get('name', 'Session')}", xalign=0)
+        title = Gtk.Label(label=f"{conn.get('name', 'VMShell')}",
+                          xalign=0)
         title.get_style_context().add_class("form-title")
-        sub = Gtk.Label(
-            label=f"{conn.get('host','')}:{conn.get('port','')}  ·  "
-                  f"{conn.get('protocol','').upper()}", xalign=0)
-        sub.get_style_context().add_class("form-sub")
-        header.pack_start(title, False, False, 0)
-        header.pack_start(sub,   False, False, 0)
-        self._menu_box.pack_start(header, False, False, 0)
+        self._menu_box.pack_start(title, False, False, 0)
+        if conn:
+            sub = Gtk.Label(
+                label=f"{conn.get('host','')}:{conn.get('port','')}  ·  "
+                      f"{conn.get('protocol','').upper()}", xalign=0)
+            sub.get_style_context().add_class("form-sub")
+            self._menu_box.pack_start(sub, False, False, 0)
 
-        # ---- Barre rapide (toujours visible) ----------------------------
-        # Évite d'avoir à ouvrir Outils → Mon PC ou Perf pour les
-        # actions/infos les plus fréquentes : batterie, mode perf,
-        # latence VM, volume.
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        sep.set_margin_top(8); sep.set_margin_bottom(8)
+        self._menu_box.pack_start(sep, False, False, 0)
+
+        # ---- Bloc infos (batterie + ping) en grand ---------------------
+        info_row = Gtk.Box(
+            orientation=Gtk.Orientation.HORIZONTAL, spacing=10)
+        info_row.set_homogeneous(True)
+
+        def _kpi(emoji, value, label, css):
+            card = Gtk.Box(
+                orientation=Gtk.Orientation.VERTICAL, spacing=2)
+            card.get_style_context().add_class("kpi-card")
+            v = Gtk.Label(xalign=0.5)
+            v.set_markup(
+                f"<span size='xx-large' weight='bold'>"
+                f"{emoji} {GLib.markup_escape_text(str(value))}</span>")
+            v.get_style_context().add_class(css)
+            l = Gtk.Label(label=label, xalign=0.5)
+            l.get_style_context().add_class("form-sub")
+            card.pack_start(v, False, False, 0)
+            card.pack_start(l, False, False, 0)
+            return card
+
+        # Batterie
         try:
-            quickbar = self._build_menu_quickbar()
-            if quickbar is not None:
-                self._menu_box.pack_start(quickbar, False, False, 0)
+            top = self.get_toplevel()
+            pct, status = (None, "")
+            if hasattr(top, "_read_battery_state"):
+                pct, status = top._read_battery_state()
+            sec, mode = estimate_battery_seconds()
+            if pct is None:
+                bat_val, bat_lbl, bat_css = "—", "Batterie", "kpi-good"
+            else:
+                if status and status.lower() == "full":
+                    bat_val = "100 %"
+                    bat_lbl = "Pleine (branchée)"
+                    bat_css = "kpi-good"
+                elif mode == "charge":
+                    bat_val = f"{pct} %"
+                    bat_lbl = f"En charge · {fmt_duration(sec)}"
+                    bat_css = "kpi-good"
+                else:
+                    bat_val = f"{pct} %"
+                    bat_lbl = (f"Reste {fmt_duration(sec)}" if sec
+                               else "Sur batterie")
+                    bat_css = ("kpi-good" if pct > 30 else
+                               "kpi-warn" if pct > 15 else "kpi-bad")
+            icon = "🔌" if mode == "charge" else (
+                "🔋" if (pct or 0) > 20 else "🪫")
+            info_row.pack_start(_kpi(icon, bat_val, bat_lbl, bat_css),
+                                True, True, 0)
         except Exception as e:
-            print(f"[vmshell] quickbar erreur (non bloquant) : {e}",
-                  flush=True)
+            print(f"[vmshell] menu batterie : {e}", flush=True)
 
-        # ---- Construction des 4 pages d'onglets -------------------------
-        page_sessions = self._build_tab_sessions()
-        page_infos    = self._build_tab_infos()
-        page_outils   = self._build_tab_outils()
-        page_perf     = self._build_tab_perf()
-
-        stack = Gtk.Stack()
-        stack.set_transition_type(Gtk.StackTransitionType.SLIDE_LEFT_RIGHT)
-        stack.set_transition_duration(180)
-        stack.add_named(page_sessions, "sessions")
-        stack.add_named(page_infos,    "infos")
-        stack.add_named(page_outils,   "outils")
-        stack.add_named(page_perf,     "perf")
-
-        # Restaure l'onglet actif demandé.
-        valid = {"sessions", "infos", "outils", "perf"}
-        if self._menu_active_tab not in valid:
-            self._menu_active_tab = "sessions"
-        # Si pas de session ouverte : "Infos" et "Outils" n'ont pas de
-        # sens → on bascule sur "Sessions" automatiquement.
-        if self._current is None and self._menu_active_tab in ("infos",
-                                                                "outils"):
-            self._menu_active_tab = "sessions"
-        stack.set_visible_child_name(self._menu_active_tab)
-
-        # ---- Barre d'onglets -------------------------------------------
-        tabs = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=6)
-        tabs.set_homogeneous(True)
-        tabs.set_margin_top(8); tabs.set_margin_bottom(8)
-
-        def _mk_tab(name, label, count=None):
-            b = Gtk.Button()
-            b.get_style_context().add_class("chip")
-            b.get_style_context().add_class("menu-tab")
-            if name == self._menu_active_tab:
-                b.get_style_context().add_class("chip-active")
-            box = Gtk.Box(
-                orientation=Gtk.Orientation.HORIZONTAL, spacing=4)
-            l = Gtk.Label(label=label)
-            box.pack_start(l, True, True, 0)
-            if count is not None and count > 0:
-                bdg = Gtk.Label(label=str(count))
-                bdg.get_style_context().add_class("nav-badge")
-                box.pack_end(bdg, False, False, 0)
-            b.add(box)
-            b.set_hexpand(True)
-
-            def _switch(*_):
-                self._menu_active_tab = name
-                stack.set_visible_child_name(name)
-                # Rafraîchit le style des onglets.
-                for child in tabs.get_children():
-                    ctx = child.get_style_context()
-                    ctx.remove_class("chip-active")
-                ctx = b.get_style_context()
-                ctx.add_class("chip-active")
-                return True
-            b.connect("clicked", _switch)
-            return b
-
-        # Compteur sessions sur le 1er onglet.
-        n_sess = len(self._sessions)
-        # Diagnostic FAIL/WARN compté sur l'onglet Perf.
-        diag_warn = 0
+        # Ping vers la VM courante
         try:
-            if DIAG and DIAG.get("results"):
-                diag_warn = sum(
-                    1 for r in DIAG["results"] if r[0] in ("FAIL", "WARN"))
-        except NameError:
-            pass
+            if self._current is not None:
+                s = self._current
+                self._refresh_latency_async(s)
+                if s.latency_ms is None:
+                    ping_val = "…"
+                    ping_lbl = "Mesure en cours"
+                    ping_css = "kpi-good"
+                else:
+                    ping_val = f"{s.latency_ms} ms"
+                    ping_lbl = ("Excellent" if s.latency_ms < 20
+                                else "Bon" if s.latency_ms < 50
+                                else "Moyen" if s.latency_ms < 100
+                                else "Lent")
+                    ping_css = ("kpi-good" if s.latency_ms < 30
+                                else "kpi-warn" if s.latency_ms < 80
+                                else "kpi-bad")
+                info_row.pack_start(_kpi("📡", ping_val, ping_lbl,
+                                         ping_css),
+                                    True, True, 0)
+        except Exception as e:
+            print(f"[vmshell] menu ping : {e}", flush=True)
 
-        tabs.pack_start(_mk_tab("sessions", "🖥  VM", n_sess),
-                        True, True, 0)
+        self._menu_box.pack_start(info_row, False, False, 0)
+
+        # ---- Bouton mode perf (Tranquille / Gamer) ---------------------
+        cur = (self._perf_profile or "tranquille").lower()
+        if cur == "gamer":
+            perf_label = "🌙  Repasser en mode Tranquille"
+            perf_target = "tranquille"
+            perf_tip = "Mode actuel : Gamer (max perf)."
+        else:
+            perf_label = "🎮  Passer en mode Gamer (max perf)"
+            perf_target = "gamer"
+            perf_tip = "Mode actuel : Tranquille."
+
+        perf_btn = Gtk.Button(label=perf_label)
+        perf_btn.set_tooltip_text(perf_tip)
+        perf_btn.get_style_context().add_class("chip")
+        perf_btn.get_style_context().add_class("chip-primary")
+        perf_btn.get_style_context().add_class("menu-big-btn")
+        perf_btn.set_margin_top(8)
+
+        def _toggle_perf(_b, _t=perf_target):
+            try:
+                self._set_profile(_t)
+            except Exception as e:
+                print(f"[vmshell] _set_profile erreur : {e}", flush=True)
+        perf_btn.connect("clicked", _toggle_perf)
+        self._menu_box.pack_start(perf_btn, False, False, 0)
+
+        # ---- Presse-papier : 2 boutons ---------------------------------
         if self._current is not None:
-            tabs.pack_start(_mk_tab("infos", "ℹ  Infos"),
-                            True, True, 0)
-            tabs.pack_start(_mk_tab("outils", "🛠  Outils"),
-                            True, True, 0)
-        tabs.pack_start(_mk_tab("perf", "⚡  Perf", diag_warn),
-                        True, True, 0)
+            clip_row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            clip_row.set_margin_top(6)
 
-        self._menu_box.pack_start(tabs, False, False, 0)
-        self._menu_box.pack_start(stack, True, True, 0)
+            paste_btn = Gtk.Button(
+                label="📋  Coller dans la VM")
+            paste_btn.set_tooltip_text(
+                "Tape le contenu du presse-papier Linux dans la VM "
+                "(secours si la synchro RDP ne suit pas).")
+            paste_btn.get_style_context().add_class("chip")
+            paste_btn.get_style_context().add_class("menu-big-btn")
+            paste_btn.connect(
+                "clicked",
+                lambda *_: self._paste_clipboard_into_vm())
 
+            hist_btn = Gtk.Button(
+                label=f"🕘  Historique ({len(CLIP_HISTORY.items())})")
+            hist_btn.set_tooltip_text(
+                "Affiche les dernières chaînes copiées pour les "
+                "recoller dans la VM.")
+            hist_btn.get_style_context().add_class("chip")
+            hist_btn.get_style_context().add_class("menu-big-btn")
+            hist_btn.connect(
+                "clicked",
+                lambda *_: self._open_clip_history_popup())
+
+            clip_row.pack_start(paste_btn, True, True, 0)
+            clip_row.pack_start(hist_btn,  True, True, 0)
+            self._menu_box.pack_start(clip_row, False, False, 0)
+
+        # ---- Séparateur + actions de bas de menu -----------------------
         sep2 = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
-        sep2.set_margin_top(8); sep2.set_margin_bottom(6)
+        sep2.set_margin_top(10); sep2.set_margin_bottom(6)
         self._menu_box.pack_start(sep2, False, False, 0)
 
-        # Bottom actions.
         row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
-        resume = Gtk.Button(label="Reprendre")
+        resume = Gtk.Button(label="↩  Reprendre")
         resume.get_style_context().add_class("chip")
         resume.connect("button-press-event",
                        lambda *_: (self.toggle_menu(), True)[1])
-        back = Gtk.Button(label="←  Fermer cette session")
-        back.get_style_context().add_class("chip")
-        back.get_style_context().add_class("chip-danger")
-        back.connect("button-press-event",
-                     lambda *_: (self.close(), True)[1])
         row.pack_start(resume, True, True, 0)
-        row.pack_start(back,   True, True, 0)
-        self._menu_box.pack_start(row, False, False, 0)
 
+        if self._current is not None:
+            close_btn = Gtk.Button(label="✕  Fermer la session")
+            close_btn.get_style_context().add_class("chip")
+            close_btn.get_style_context().add_class("chip-danger")
+            close_btn.connect(
+                "button-press-event",
+                lambda *_: (self.close(), True)[1])
+            row.pack_start(close_btn, True, True, 0)
+
+        self._menu_box.pack_start(row, False, False, 0)
         self._menu_box.show_all()
 
     # ---- Barre rapide (header du menu Échap) --------------------------
