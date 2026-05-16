@@ -497,220 +497,23 @@ def detect_monitors():
 
 # ---------------------------------------------------------------------------
 # Estimation autonomie batterie (depuis /sys/class/power_supply)
+# Implémentation : voir vm_battery.py (module pur, cache 5 s).
 # ---------------------------------------------------------------------------
-# Cache résultat batterie ~5s : évite de relire /sys/ à chaque tick UI
-# (quickbar, popup alimentation, _battery_watch_tick, miniatures...).
-_BAT_CACHE = {"t": 0.0, "val": (None, None)}
-_BAT_CACHE_TTL = 5.0
-
-
-def estimate_battery_seconds():
-    """Estime le temps restant (s) en se basant sur energy_now / power_now
-    ou charge_now / current_now selon ce que le noyau expose.
-    Retourne (seconds, mode) avec mode = 'discharge'|'charge'|None.
-    Résultat caché ~5s."""
-    now = time.monotonic()
-    if now - _BAT_CACHE["t"] < _BAT_CACHE_TTL:
-        return _BAT_CACHE["val"]
-    val = _estimate_battery_seconds_uncached()
-    _BAT_CACHE["t"] = now
-    _BAT_CACHE["val"] = val
-    return val
-
-
-def _estimate_battery_seconds_uncached():
-    try:
-        base = "/sys/class/power_supply"
-        if not os.path.isdir(base):
-            return None, None
-        for name in sorted(os.listdir(base)):
-            if not name.startswith("BAT"):
-                continue
-            d = os.path.join(base, name)
-
-            def _r(fname):
-                try:
-                    with open(os.path.join(d, fname)) as f:
-                        return int(f.read().strip())
-                except (OSError, ValueError):
-                    return None
-
-            status = ""
-            try:
-                with open(os.path.join(d, "status")) as f:
-                    status = f.read().strip().lower()
-            except OSError:
-                pass
-            if status == "full":
-                return 0, "full"
-
-            # En décharge : energy_now / power_now (Wh/W → h).
-            energy = _r("energy_now")
-            power  = _r("power_now")
-            if energy is not None and power and power > 0:
-                if status.startswith("charg") and not status.startswith("not"):
-                    energy_full = _r("energy_full") or energy
-                    remain = max(0, energy_full - energy)
-                    return int(remain * 3600 / power), "charge"
-                return int(energy * 3600 / power), "discharge"
-
-            # Fallback charge_now / current_now.
-            charge = _r("charge_now")
-            current = _r("current_now")
-            if charge is not None and current and current > 0:
-                if status.startswith("charg") and not status.startswith("not"):
-                    cfull = _r("charge_full") or charge
-                    remain = max(0, cfull - charge)
-                    return int(remain * 3600 / current), "charge"
-                return int(charge * 3600 / current), "discharge"
-    except OSError:
-        pass
-    return None, None
-
-
-def fmt_duration(sec):
-    """3725 → '1h02'  ·  120 → '2 min'."""
-    if sec is None or sec < 0:
-        return "—"
-    if sec < 60:
-        return f"{sec}s"
-    m = sec // 60
-    if m < 60:
-        return f"{m} min"
-    h = m // 60
-    return f"{h}h{m % 60:02d}"
+from vm_battery import estimate_battery_seconds, fmt_duration  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Test de débit local → VM (ping + RTT TCP)
+# Implémentation : voir vm_netprobe.py (module pur).
 # ---------------------------------------------------------------------------
-def speedtest_to(host, port, timeout=4.0):
-    """Mesure ping (5 paquets ICMP) et latence d'ouverture TCP vers host:port.
-    Retourne dict {ping_avg, ping_loss, tcp_ms, verdict}.
-    Pas de mesure de bande passante (pas d'iperf garanti côté VM)."""
-    out = {"ping_avg": None, "ping_loss": None,
-           "tcp_ms": None, "verdict": "?"}
-    # Ping ICMP.
-    try:
-        p = subprocess.run(
-            ["ping", "-c", "5", "-W", "1", "-q", host],
-            capture_output=True, text=True, timeout=timeout + 6)
-        for line in p.stdout.splitlines():
-            if "packet loss" in line:
-                # ex: "5 packets transmitted, 5 received, 0% packet loss"
-                for tok in line.replace(",", " ").split():
-                    if tok.endswith("%"):
-                        try:
-                            out["ping_loss"] = float(tok[:-1])
-                        except ValueError:
-                            pass
-            if line.startswith("rtt") or line.startswith("round-trip"):
-                # ex: rtt min/avg/max/mdev = 1.2/2.5/4.1/0.7 ms
-                try:
-                    nums = line.split("=")[1].strip().split()[0].split("/")
-                    out["ping_avg"] = float(nums[1])
-                except (IndexError, ValueError):
-                    pass
-    except (subprocess.SubprocessError, OSError):
-        pass
-
-    # Mesure 3× ouverture TCP.
-    samples = []
-    for _ in range(3):
-        t0 = time.time()
-        try:
-            with socket.create_connection((host, int(port)), timeout=timeout):
-                samples.append((time.time() - t0) * 1000.0)
-        except OSError:
-            pass
-    if samples:
-        out["tcp_ms"] = round(sum(samples) / len(samples), 1)
-
-    # Verdict.
-    avg = out["ping_avg"] if out["ping_avg"] is not None else out["tcp_ms"]
-    loss = out["ping_loss"] or 0.0
-    if avg is None:
-        out["verdict"] = "Injoignable"
-    elif loss >= 5 or avg >= 120:
-        out["verdict"] = "Mauvais"
-    elif avg >= 60:
-        out["verdict"] = "Acceptable"
-    elif avg >= 25:
-        out["verdict"] = "Bon"
-    else:
-        out["verdict"] = "Excellent"
-    return out
+from vm_netprobe import speedtest_to  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
 # Dictée vocale : enregistrement audio + transcription locale
+# Implémentation : voir vm_stt.py (module pur, détection whisper/whisper-cpp).
 # ---------------------------------------------------------------------------
-def stt_available():
-    """Retourne le nom (ou chemin) du moteur STT dispo, ou None.
-    Recherche aussi dans ``~/.local/bin`` (où ``pip install --user`` dépose
-    la commande ``whisper`` sans nécessiter un redémarrage de shell)."""
-    for cmd in ("whisper-cpp", "whisper.cpp", "whisper", "nerd-dictation"):
-        p = shutil.which(cmd)
-        if p:
-            return p
-    # Fallback : ~/.local/bin n'est pas toujours dans PATH dans une
-    # session lancée par xdg autostart.
-    user_bin = os.path.expanduser("~/.local/bin")
-    for cmd in ("whisper-cpp", "whisper", "nerd-dictation"):
-        p = os.path.join(user_bin, cmd)
-        if os.path.isfile(p) and os.access(p, os.X_OK):
-            return p
-    return None
-
-
-def stt_install_check():
-    """Diagnostic rapide pour la fenêtre d'installation. Retourne un dict
-    avec les pré-requis détectés."""
-    return {
-        "pip":     bool(shutil.which("pip3") or shutil.which("pip")),
-        "python":  bool(shutil.which("python3")),
-        "ffmpeg":  bool(shutil.which("ffmpeg")),
-        "arecord": bool(shutil.which("arecord")),
-        "engine":  stt_available(),
-    }
-
-
-def stt_transcribe(wav_path):
-    """Tente de transcrire un fichier WAV en français. Retourne le texte
-    ou None si aucun moteur dispo / erreur."""
-    eng = stt_available()
-    if not eng:
-        return None
-    eng_name = os.path.basename(eng)
-    try:
-        if "whisper-cpp" in eng_name or "whisper.cpp" in eng_name:
-            # whisper.cpp : -l fr -nt -np pour sortie texte propre.
-            r = subprocess.run(
-                [eng, "-f", wav_path, "-l", "fr", "-nt", "-np",
-                 "-otxt", "-of", wav_path],
-                capture_output=True, text=True, timeout=120)
-            txt_path = wav_path + ".txt"
-            if os.path.isfile(txt_path):
-                with open(txt_path) as f:
-                    return f.read().strip()
-            return (r.stdout or "").strip()
-        if eng_name == "whisper":
-            # OpenAI whisper : --model tiny pour rapidité.
-            r = subprocess.run(
-                [eng, wav_path, "--language", "French",
-                 "--model", "tiny", "--output_format", "txt",
-                 "--output_dir", os.path.dirname(wav_path) or "."],
-                capture_output=True, text=True, timeout=180)
-            base = os.path.splitext(os.path.basename(wav_path))[0]
-            txt_path = os.path.join(
-                os.path.dirname(wav_path) or ".", base + ".txt")
-            if os.path.isfile(txt_path):
-                with open(txt_path) as f:
-                    return f.read().strip()
-            return (r.stdout or "").strip()
-    except (subprocess.SubprocessError, OSError):
-        pass
-    return None
+from vm_stt import stt_available, stt_install_check, stt_transcribe  # noqa: E402
 
 
 # ---------------------------------------------------------------------------
