@@ -4773,6 +4773,148 @@ class VMShell(Gtk.Window):
             b.pack_start(w, False, False, 0)
         return b
 
+    def _build_rdp_codec_panel(self):
+        """Affiche, dans Paramètres, l'état réel de l'encodage RDP :
+        codec choisi (AVC444/AVC420/RemoteFX), compression, profondeur,
+        GPU détecté et accélération matérielle (VAAPI / nvidia)."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=4)
+        box.set_margin_top(8)
+
+        sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
+        box.pack_start(sep, False, False, 4)
+
+        hdr = Gtk.Label(label="Encodage vidéo RDP", xalign=0)
+        hdr.get_style_context().add_class("form-title")
+        box.pack_start(hdr, False, False, 0)
+
+        # ---- Mode perf courant ----------------------------------------
+        profile = "tranquille"
+        try:
+            if self._console and self._console._perf_profile:
+                profile = self._console._perf_profile.lower()
+        except Exception:
+            pass
+
+        gpu_vendor = (HW_INFO.get("gpu_vendor") or "—").upper()
+        gpu_accel = bool(HW_INFO.get("gpu_accel"))
+
+        # ---- Codec qui sera réellement envoyé à xfreerdp --------------
+        if profile == "gamer":
+            if gpu_accel:
+                codec = "H.264 AVC420 progressif + RemoteFX vidéo"
+                bpp = "32 bits"
+                compression = "✅  Activée (réseau prioritaire)"
+                network = "broadband"
+                extras = ["frame-ack:2", "async-update", "async-channels",
+                          "son medium 40 ms"]
+            else:
+                codec = "RemoteFX (RFX) — mode image"
+                bpp = "16 bits"
+                compression = "✅  Activée (CPU prioritaire)"
+                network = "broadband"
+                extras = ["frame-ack:4", "async-update", "async-channels",
+                          "son low 60 ms", "sans AVC (pas de GPU)"]
+        else:  # tranquille
+            if gpu_accel:
+                codec = "H.264 AVC444 progressif (qualité max)"
+                bpp = "32 bits"
+                compression = "○  Désactivée (LAN, qualité d'image max)"
+                network = "lan"
+                extras = ["son full", "micro activé"]
+            else:
+                codec = "RemoteFX (RFX) 32 bits"
+                bpp = "32 bits"
+                compression = "✅  Activée"
+                network = "lan"
+                extras = ["son full", "micro activé", "sans AVC"]
+
+        # ---- Détection VAAPI / vainfo (info bonus) --------------------
+        vaapi_info = "—"
+        try:
+            if shutil.which("vainfo"):
+                r = subprocess.run(
+                    ["vainfo"], capture_output=True, text=True,
+                    timeout=2)
+                blob = (r.stdout or "") + (r.stderr or "")
+                profiles = []
+                for line in blob.splitlines():
+                    if "VAProfileH264" in line and "Enc" not in line:
+                        profiles.append("H.264")
+                    elif "VAProfileHEVC" in line and "Enc" not in line:
+                        profiles.append("HEVC")
+                    elif "VAProfileVP9" in line and "Enc" not in line:
+                        profiles.append("VP9")
+                    elif "VAProfileAV1" in line and "Enc" not in line:
+                        profiles.append("AV1")
+                profiles = sorted(set(profiles))
+                if profiles:
+                    vaapi_info = (f"VAAPI OK · décodage : "
+                                  f"{', '.join(profiles)}")
+                else:
+                    vaapi_info = ("VAAPI dispo mais aucun profil "
+                                  "vidéo détecté")
+            elif gpu_accel:
+                vaapi_info = "Render node OK (vainfo absent)"
+            else:
+                vaapi_info = "Aucune accélération matérielle détectée"
+        except Exception:
+            vaapi_info = "Vérification VAAPI impossible"
+
+        # ---- Affichage --------------------------------------------------
+        def _kv(key, value, css=None):
+            row = Gtk.Box(
+                orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+            k = Gtk.Label(label=key, xalign=0)
+            k.get_style_context().add_class("form-sub")
+            k.set_size_request(180, -1)
+            v = Gtk.Label(label=value, xalign=0)
+            v.set_line_wrap(True)
+            v.set_selectable(True)
+            if css:
+                v.get_style_context().add_class(css)
+            row.pack_start(k, False, False, 0)
+            row.pack_start(v, True, True, 0)
+            return row
+
+        prof_label = ("🎮  Gamer (perf max)" if profile == "gamer"
+                      else "🌙  Tranquille (qualité max)")
+        box.pack_start(_kv(
+            "Mode actuel :", prof_label,
+            "kpi-good" if profile == "gamer" else None),
+            False, False, 0)
+        box.pack_start(_kv(
+            "GPU détecté :",
+            (f"{gpu_vendor}" if gpu_vendor != "—"
+             else "Aucun GPU identifiable"),
+            "kpi-good" if gpu_accel else "kpi-warn"),
+            False, False, 0)
+        box.pack_start(_kv(
+            "Accélération matérielle :",
+            ("✅  Active (pilote opérationnel)" if gpu_accel
+             else "⚠  Indisponible — décodage CPU uniquement"),
+            "kpi-good" if gpu_accel else "kpi-bad"),
+            False, False, 0)
+        box.pack_start(_kv("Décodage VAAPI :", vaapi_info),
+                       False, False, 0)
+        box.pack_start(_kv("Codec RDP :", codec, "kpi-good"),
+                       False, False, 0)
+        box.pack_start(_kv("Compression :", compression), False, False, 0)
+        box.pack_start(_kv("Profondeur :", bpp), False, False, 0)
+        box.pack_start(_kv("Profil réseau :", network), False, False, 0)
+        box.pack_start(_kv("Options :", "  ·  ".join(extras)),
+                       False, False, 0)
+
+        # Hint pédagogique
+        hint = Gtk.Label(
+            label=("ℹ  Le codec ci-dessus est celui qui sera envoyé à "
+                   "xfreerdp à la prochaine connexion. Bascule le mode "
+                   "perf depuis la quickbar du menu Échap."),
+            xalign=0)
+        hint.set_line_wrap(True)
+        hint.get_style_context().add_class("form-sub")
+        box.pack_start(hint, False, False, 4)
+        return box
+
     def _build_settings_panel(self):
         b = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=12)
         b.get_style_context().add_class("form-card")
@@ -4825,6 +4967,12 @@ class VMShell(Gtk.Window):
             xalign=0)
         info.get_style_context().add_class("vm-meta")
         b.pack_start(info, False, False, 0)
+
+        # ---- Encodage vidéo RDP & accélération matérielle ---------------
+        try:
+            b.pack_start(self._build_rdp_codec_panel(), False, False, 0)
+        except Exception as e:
+            print(f"[vmshell] codec panel erreur : {e}", flush=True)
 
         # ---- Auto-démarrage Linux --------------------------------------
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
