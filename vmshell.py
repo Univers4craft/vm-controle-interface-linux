@@ -3116,7 +3116,8 @@ class VMShell(Gtk.Window):
         GLib.timeout_add(300,  lambda: (self._check_all_statuses(), False)[1])
         GLib.timeout_add_seconds(60, lambda: (self._check_all_statuses(), True)[1])
 
-        # Surveillance batterie : alerte à 10 %, action critique à 5 %.
+        # Surveillance batterie : alerte à 20 %, 10 %, action critique à 5 %.
+        self._bat_warned_info = False
         self._bat_warned_low = False
         self._bat_warned_critical = False
         GLib.timeout_add_seconds(30, self._battery_watch_tick)
@@ -3196,12 +3197,18 @@ class VMShell(Gtk.Window):
         pct, status = self._read_battery_state()
         if pct is None:
             return True
-        on_battery = ("charg" not in status.lower() or
-                      status.lower().startswith("not"))
+        st = (status or "").strip().lower()
+        # On considère "sur batterie" si le statut indique explicitement
+        # une décharge ou "not charging" (chargeur branché mais inactif).
+        # Bug historique : la condition était inversée — "discharging"
+        # contient "charg", donc ``"charg" not in st`` valait False et
+        # aucune alerte n'était déclenchée.
+        on_battery = ("discharg" in st) or st.startswith("not")
         # On ne déclenche les alertes que si on est sur batterie.
-        if not on_battery or status.lower() == "full":
+        if not on_battery:
             # Reset des flags dès qu'on rebranche / charge.
-            if pct >= 25:
+            if pct >= 25 or st in ("charging", "full"):
+                self._bat_warned_info = False
                 self._bat_warned_low = False
                 self._bat_warned_critical = False
             return True
@@ -3210,6 +3217,7 @@ class VMShell(Gtk.Window):
         if pct <= 5 and not self._bat_warned_critical:
             self._bat_warned_critical = True
             self._bat_warned_low = True  # évite le double pop-up
+            self._bat_warned_info = True
             # 1) bascule en éco.
             try:
                 if shutil.which("powerprofilesctl"):
@@ -3254,11 +3262,22 @@ class VMShell(Gtk.Window):
         # ---- 10 % : avertissement -------------------------------------
         if pct <= 10 and not self._bat_warned_low:
             self._bat_warned_low = True
+            self._bat_warned_info = True
             self._battery_alert(
                 level="warning",
                 title="⚠  Batterie faible",
                 msg=(f"Il reste <b>{pct}%</b> de batterie.\n\n"
                      "Pense à brancher l'ordinateur sur le secteur."))
+            return True
+
+        # ---- 20 % : info (premier seuil rouge) ------------------------
+        if pct <= 20 and not self._bat_warned_info:
+            self._bat_warned_info = True
+            self._battery_alert(
+                level="warning",
+                title="🔋  Batterie à 20 %",
+                msg=(f"Il reste <b>{pct}%</b> de batterie.\n\n"
+                     "Tu peux continuer mais pense au chargeur."))
         return True
 
     def _battery_alert(self, level, title, msg):
@@ -4690,6 +4709,37 @@ class VMShell(Gtk.Window):
 
         path_row.pack_start(open_btn, False, False, 0)
         path_row.pack_start(copy_btn, False, False, 0)
+
+        # Bouton de test du système d'alerte batterie (vérifie que le
+        # pop-up + son fonctionnent même quand la batterie n'est pas
+        # encore basse).
+        bat_test_btn = Gtk.Button(label="🔋  Tester l'alerte batterie")
+        bat_test_btn.get_style_context().add_class("chip")
+        bat_test_btn.set_tooltip_text(
+            "Affiche un pop-up d'avertissement factice pour vérifier "
+            "que les notifications batterie fonctionnent.")
+
+        def _on_bat_test(*_):
+            pct, status = self._read_battery_state()
+            if pct is None:
+                msg = ("⚠  Aucune batterie détectée sur ce poste.\n\n"
+                       "Le test affiche quand même un pop-up pour "
+                       "vérifier l'affichage.")
+            else:
+                msg = (f"Batterie actuelle : <b>{pct}%</b> "
+                       f"({status or '?'}).\n\n"
+                       "Si tu vois ce pop-up + entends un son, "
+                       "les alertes batterie fonctionnent.\n\n"
+                       "Les vraies alertes se déclenchent à "
+                       "<b>20 %</b>, <b>10 %</b> et <b>5 %</b> en "
+                       "décharge.")
+            self._battery_alert(
+                level="warning",
+                title="🧪  Test alerte batterie",
+                msg=msg)
+        bat_test_btn.connect("clicked", _on_bat_test)
+        path_row.pack_start(bat_test_btn, False, False, 0)
+
         b.pack_start(path_row, False, False, 0)
 
         info = Gtk.Label(
