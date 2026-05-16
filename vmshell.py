@@ -326,6 +326,11 @@ from vm_stt import stt_available, stt_install_check, stt_transcribe  # noqa: E40
 # ---------------------------------------------------------------------------
 from vm_hotkeys import EscapeGrabber, HotkeyGrabber  # noqa: E402
 
+# ---------------------------------------------------------------------------
+# Détection / bascule Wi-Fi 5 GHz : voir vm_wifi.py
+# ---------------------------------------------------------------------------
+import vm_wifi  # noqa: E402
+
 
 # ---------------------------------------------------------------------------
 # Connection model
@@ -2878,7 +2883,6 @@ echo OK
                    f"/size:{sw}x{sh}",
                    "/cert:ignore",
                    "/dynamic-resolution",
-                   "+clipboard",
                    f"/drive:home,{home}",
                    "/printer",
                    "/usb:auto",
@@ -2913,8 +2917,10 @@ echo OK
             cmd.append(f"/parent-window:{xid}")
             if conn.get("password"):
                 cmd.append(f"/p:{conn['password']}")
+            # Préfixe temps-réel (taskset + chrt) si dispo et activé.
+            launch_cmd = self._wrap_realtime(cmd, perf)
             try:
-                s.proc = subprocess.Popen(cmd)
+                s.proc = subprocess.Popen(launch_cmd)
                 log_session("start", conn)
                 if profile == "gamer":
                     freeze_background_apps()
@@ -3143,6 +3149,12 @@ class VMShell(Gtk.Window):
             GLib.idle_add(self._hk_grab.start)
         except Exception:
             pass
+
+        # Détection capabilities temps-réel + préchauffage xfreerdp +
+        # check Wi-Fi (toast suggérant 5 GHz si on est en 2.4 GHz).
+        self._rt_chrt_ok = self._detect_chrt_capability()
+        GLib.timeout_add_seconds(1, self._prewarm_xfreerdp_once)
+        GLib.timeout_add_seconds(5, self._check_wifi_band_once)
 
         # État de l'animation des cartes (miniatures vivantes).
         # Les cartes en mode grille s'animent doucement quand AUCUNE
@@ -4190,23 +4202,27 @@ class VMShell(Gtk.Window):
                 d = dict(codec="avc420", network="broadband", bpp="32",
                          compression="on", frame_ack=2, async_=True,
                          eye_candy_off=True, audio_lat="40",
-                         audio_q="medium")
+                         audio_q="medium",
+                         realtime=True, clipboard_fast=True)
             else:
                 d = dict(codec="rfx-image", network="broadband",
                          bpp="16", compression="on", frame_ack=4,
                          async_=True, eye_candy_off=True,
-                         audio_lat="60", audio_q="low")
+                         audio_lat="60", audio_q="low",
+                         realtime=True, clipboard_fast=True)
         else:  # tranquille
             if hw_ok:
                 d = dict(codec="avc444", network="lan", bpp="32",
                          compression="off", frame_ack=0, async_=False,
                          eye_candy_off=False, audio_lat="",
-                         audio_q="medium")
+                         audio_q="medium",
+                         realtime=False, clipboard_fast=True)
             else:
                 d = dict(codec="rfx", network="lan", bpp="32",
                          compression="on", frame_ack=0, async_=False,
                          eye_candy_off=False, audio_lat="",
-                         audio_q="medium")
+                         audio_q="medium",
+                         realtime=False, clipboard_fast=True)
 
         # --- 2) préset "Ultra-latence" (<20 ms visé) ---
         if user.get("rdp_ultra_latency"):
@@ -4214,7 +4230,8 @@ class VMShell(Gtk.Window):
                 codec=("avc420" if hw_ok else "rfx-image"),
                 network="autodetect", bpp="16",
                 compression="on", frame_ack=1, async_=True,
-                eye_candy_off=True, audio_lat="20", audio_q="low")
+                eye_candy_off=True, audio_lat="20", audio_q="low",
+                realtime=True, clipboard_fast=True)
 
         # --- 3) surcharges utilisateur (non-"auto") ---
         v = user.get("rdp_codec", "auto")
@@ -4248,11 +4265,23 @@ class VMShell(Gtk.Window):
             d["audio_q"] = "low" if int(al) <= 30 else "medium"
         elif al == "full":
             d["audio_lat"] = ""
+        # realtime / clipboard-fast overrides (auto = on/off du profil)
+        rt = user.get("rdp_realtime", "auto")
+        if rt in ("on", "off"):
+            d["realtime"] = (rt == "on")
+        cf = user.get("rdp_clipboard_fast", "auto")
+        if cf in ("on", "off"):
+            d["clipboard_fast"] = (cf == "on")
         return d
 
     def _emit_rdp_perf_args(self, p):
         """Convertit le dict de réglages en arguments xfreerdp."""
         args = [f"/network:{p['network']}", f"/bpp:{p['bpp']}"]
+        # Presse-papier rapide (sélection X11 + clipboard CLIPBOARD).
+        if p.get("clipboard_fast"):
+            args.append("/clipboard:use-selection")
+        else:
+            args.append("+clipboard")
         c = p.get("codec")
         if c == "avc444":
             args.append("/gfx:AVC444:on,progressive:on")
@@ -4281,6 +4310,101 @@ class VMShell(Gtk.Window):
         else:
             args.append("/sound:sys:pulse")
         return args
+
+    def _wrap_realtime(self, cmd, perf):
+        """Préfixe la commande xfreerdp avec taskset + chrt si dispo et
+        si le profil le demande (réduit le jitter d'ordonnancement)."""
+        if not perf.get("realtime"):
+            return cmd
+        prefix = []
+        # Affinité : cœurs 2,3 (évite les E-cores Intel et les cœurs 0,1
+        # surchargés par le compositeur). Best-effort si >= 4 cœurs.
+        try:
+            ncpu = os.cpu_count() or 1
+        except Exception:
+            ncpu = 1
+        if shutil.which("taskset") and ncpu >= 4:
+            prefix += ["taskset", "-c", "2,3"]
+        # Priorité temps-réel SCHED_RR : nécessite CAP_SYS_NICE. On
+        # teste une fois au démarrage (_rt_chrt_ok) ; si KO on n'ajoute
+        # rien plutôt que de risquer "Operation not permitted" qui ferait
+        # échouer le lancement entier.
+        if getattr(self, "_rt_chrt_ok", False) and shutil.which("chrt"):
+            prefix += ["chrt", "-r", "10"]
+        return prefix + cmd if prefix else cmd
+
+    def _detect_chrt_capability(self):
+        """Vérifie une fois si on peut utiliser chrt -r (CAP_SYS_NICE).
+        Si non, on ne l'inclura jamais dans le préfixe temps-réel pour
+        éviter d'échouer le lancement de xfreerdp."""
+        if not shutil.which("chrt"):
+            return False
+        try:
+            r = subprocess.run(
+                ["chrt", "-r", "10", "true"],
+                capture_output=True, timeout=2)
+            ok = (r.returncode == 0)
+            if ok:
+                print("[vmshell] chrt -r dispo (temps-réel actif).",
+                      flush=True)
+            else:
+                print("[vmshell] chrt -r indispo "
+                      "(CAP_SYS_NICE manquant) — fallback nice.",
+                      flush=True)
+            return ok
+        except (subprocess.SubprocessError, OSError):
+            return False
+
+    def _prewarm_xfreerdp_once(self):
+        """Lit le binaire xfreerdp dans le page cache du noyau pour que
+        le premier lancement soit ~200-400 ms plus rapide."""
+        try:
+            bin_ = find_xfreerdp()
+            if bin_ and os.path.isfile(bin_):
+                def _read():
+                    try:
+                        with open(bin_, "rb") as f:
+                            while f.read(1 << 20):
+                                pass
+                    except OSError:
+                        pass
+                threading.Thread(target=_read, daemon=True).start()
+        except Exception:
+            pass
+        return False  # one-shot
+
+    def _check_wifi_band_once(self):
+        """Au démarrage : si on est sur du Wi-Fi 2.4 GHz et qu'un AP
+        5 GHz du même SSID est dispo, propose la bascule via toast."""
+        try:
+            sugg = vm_wifi.suggest_5ghz()
+        except Exception as e:
+            print(f"[vmshell] wifi check erreur : {e}", flush=True)
+            return False
+        if not sugg:
+            # Au moins log la bande courante si dispo.
+            try:
+                link = vm_wifi.current_link()
+                if link:
+                    print(f"[vmshell] Wi-Fi : {link['band']} "
+                          f"({link.get('ssid') or '?'}, "
+                          f"{link.get('signal_dbm','?')} dBm)",
+                          flush=True)
+            except Exception:
+                pass
+            return False
+        cur = sugg["current"]
+        tgt = sugg["target"]
+        try:
+            self._toast(
+                f"📡 Wi-Fi 2.4 GHz détecté ({cur.get('ssid','?')}) — "
+                f"AP 5 GHz dispo ({tgt['signal']}%). "
+                f"Voir Paramètres → Wi-Fi.")
+        except Exception:
+            pass
+        # Stocke la suggestion pour le panneau Paramètres.
+        self._wifi_suggestion = sugg
+        return False  # one-shot
 
     def _build_rdp_codec_panel(self):
         """Affiche, dans Paramètres, l'état réel de l'encodage RDP :
@@ -4586,6 +4710,23 @@ class VMShell(Gtk.Window):
         ], cur.get("rdp_audio_latency", "auto"), "rdp_audio_latency")),
                        False, False, 0)
 
+        # ---- 9b) Affinité CPU + priorité temps-réel ----
+        box.pack_start(_row("Affinité CPU + priorité RT :", _combo([
+            ("auto", "Auto (suit le mode perf — gamer = on)"),
+            ("on",   "Forcer ON (taskset cœurs 2,3 + chrt RR 10)"),
+            ("off",  "Forcer OFF — pas de préfixe"),
+        ], cur.get("rdp_realtime", "auto"), "rdp_realtime")),
+                       False, False, 0)
+
+        # ---- 9c) Presse-papier rapide (use-selection) ----
+        box.pack_start(_row("Presse-papier rapide :", _combo([
+            ("auto", "Auto (recommandé — instantané)"),
+            ("on",   "Forcer use-selection (PRIMARY + CLIPBOARD)"),
+            ("off",  "Mode standard (+clipboard simple)"),
+        ], cur.get("rdp_clipboard_fast", "auto"),
+            "rdp_clipboard_fast")),
+                       False, False, 0)
+
         # ---- 10) Test de latence sur la dernière connexion en ligne ----
         btn_row = Gtk.Box(
             orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
@@ -4645,7 +4786,8 @@ class VMShell(Gtk.Window):
                 for k in ("rdp_ultra_latency", "rdp_codec",
                           "rdp_network", "rdp_bpp", "rdp_compression",
                           "rdp_frame_ack", "rdp_async",
-                          "rdp_disable_eye_candy", "rdp_audio_latency"):
+                          "rdp_disable_eye_candy", "rdp_audio_latency",
+                          "rdp_realtime", "rdp_clipboard_fast"):
                     data.pop(k, None)
                 save_json_atomic(SETTINGS_FILE, data)
                 self._toast("Réglages perf remis en Auto. "
@@ -4665,6 +4807,124 @@ class VMShell(Gtk.Window):
         tip.set_line_wrap(True)
         tip.get_style_context().add_class("form-sub")
         box.pack_start(tip, False, False, 4)
+
+        return box
+
+    def _build_wifi_panel(self):
+        """Panneau Wi-Fi : affiche la bande courante (2.4/5/6 GHz) et,
+        si on est sur du 2.4 GHz avec un AP 5 GHz visible du même SSID,
+        propose un bouton de bascule."""
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL, spacing=6)
+        box.set_margin_top(10)
+        box.get_style_context().add_class("form-card")
+
+        hdr = Gtk.Label(label="Wi-Fi — bande & priorité 5 GHz",
+                        xalign=0)
+        hdr.get_style_context().add_class("form-title")
+        box.pack_start(hdr, False, False, 0)
+
+        sub = Gtk.Label(
+            label="Le 5 GHz a beaucoup moins de latence et "
+                  "d'interférences que le 2.4 GHz. Idéal pour le RDP.",
+            xalign=0)
+        sub.set_line_wrap(True)
+        sub.get_style_context().add_class("form-sub")
+        box.pack_start(sub, False, False, 0)
+
+        # État courant
+        state_lbl = Gtk.Label(xalign=0)
+        state_lbl.set_line_wrap(True)
+        box.pack_start(state_lbl, False, False, 4)
+
+        # Boutons
+        row = Gtk.Box(orientation=Gtk.Orientation.HORIZONTAL, spacing=8)
+        refresh_btn = Gtk.Button(label="↻  Rafraîchir")
+        refresh_btn.get_style_context().add_class("chip")
+        switch_btn = Gtk.Button(label="🚀  Basculer en 5 GHz")
+        switch_btn.get_style_context().add_class("chip")
+        switch_btn.get_style_context().add_class("chip-primary")
+        switch_btn.set_sensitive(False)
+        row.pack_start(refresh_btn, False, False, 0)
+        row.pack_start(switch_btn, False, False, 0)
+        box.pack_start(row, False, False, 0)
+
+        # État partagé via closure
+        state = {"target_bssid": None}
+
+        def _refresh(*_):
+            try:
+                link = vm_wifi.current_link()
+            except Exception as e:
+                state_lbl.set_markup(f"<i>Erreur : {e}</i>")
+                return
+            if not link:
+                state_lbl.set_markup(
+                    "<i>Pas de Wi-Fi actif (Ethernet ou hors couverture). "
+                    "L'Ethernet est encore meilleur que le 5 GHz.</i>")
+                switch_btn.set_sensitive(False)
+                return
+            band = link["band"]
+            ssid = link.get("ssid") or "?"
+            sig = link.get("signal_dbm")
+            sig_s = f"{sig} dBm" if sig is not None else "?"
+            color = ("kpi-good" if band != "2.4 GHz" else "kpi-warn")
+            state_lbl.set_markup(
+                f"Connecté à <b>{GLib.markup_escape_text(ssid)}</b> · "
+                f"<b>{band}</b> · signal {sig_s} · "
+                f"interface {link['iface']}")
+            for c in ("kpi-good", "kpi-warn", "kpi-bad"):
+                state_lbl.get_style_context().remove_class(c)
+            state_lbl.get_style_context().add_class(color)
+            if band == "2.4 GHz":
+                try:
+                    cands = vm_wifi.scan_5ghz_for_ssid(ssid)
+                except Exception:
+                    cands = []
+                if cands:
+                    best = cands[0]
+                    state["target_bssid"] = best["bssid"]
+                    switch_btn.set_label(
+                        f"🚀  Basculer en 5 GHz "
+                        f"(signal {best['signal']}%, ch. {best['chan']})")
+                    switch_btn.set_sensitive(True)
+                else:
+                    state["target_bssid"] = None
+                    switch_btn.set_label("🚀  Aucun AP 5 GHz visible")
+                    switch_btn.set_sensitive(False)
+            else:
+                state["target_bssid"] = None
+                switch_btn.set_label("✓  Déjà sur 5 GHz / 6 GHz")
+                switch_btn.set_sensitive(False)
+
+        def _switch(*_):
+            bssid = state.get("target_bssid")
+            if not bssid:
+                self._toast("Aucun BSSID 5 GHz disponible.")
+                return
+            switch_btn.set_sensitive(False)
+            switch_btn.set_label("⏳  Bascule en cours…")
+
+            def _worker():
+                try:
+                    ok, msg = vm_wifi.switch_to_bssid(bssid, timeout=12)
+                except Exception as e:
+                    ok, msg = False, str(e)
+                GLib.idle_add(_done, ok, msg)
+
+            def _done(ok, msg):
+                if ok:
+                    self._toast(f"✓  Connecté en 5 GHz : {msg}")
+                else:
+                    self._toast(f"✗  Échec bascule : {msg}")
+                _refresh()
+                return False
+            threading.Thread(target=_worker, daemon=True).start()
+
+        refresh_btn.connect("clicked", _refresh)
+        switch_btn.connect("clicked", _switch)
+        # Premier remplissage en arrière-plan (peut bloquer 1-2 s sur le
+        # scan, donc on diffère).
+        GLib.timeout_add(200, lambda: (_refresh(), False)[1])
 
         return box
 
@@ -4763,6 +5023,12 @@ class VMShell(Gtk.Window):
             b.pack_start(self._build_rdp_perf_panel(), False, False, 0)
         except Exception as e:
             print(f"[vmshell] perf panel erreur : {e}", flush=True)
+
+        # ---- Wi-Fi (détection bande + bascule 5 GHz) -------------------
+        try:
+            b.pack_start(self._build_wifi_panel(), False, False, 0)
+        except Exception as e:
+            print(f"[vmshell] wifi panel erreur : {e}", flush=True)
 
         # ---- Auto-démarrage Linux --------------------------------------
         sep = Gtk.Separator(orientation=Gtk.Orientation.HORIZONTAL)
