@@ -1570,15 +1570,38 @@ class ConsolePage(Gtk.Box):
         s._lat_inflight = True
 
         def probe():
-            t0 = time.time()
-            ok = False
+            # Priorité ICMP : c'est le vrai ping réseau. Le handshake TCP
+            # inclut souvent 30-50 ms d'overhead du service RDP côté VM
+            # (négociation NLA/Kerberos) qui fausse la mesure de latence.
+            dt = None
             try:
-                with socket.create_connection(
-                        (s.conn["host"], int(s.conn["port"])), timeout=1.5):
-                    ok = True
-            except OSError:
-                ok = False
-            dt = int((time.time() - t0) * 1000) if ok else None
+                p = subprocess.run(
+                    ["ping", "-c", "3", "-W", "1", "-q", s.conn["host"]],
+                    capture_output=True, text=True, timeout=5)
+                for line in p.stdout.splitlines():
+                    if line.startswith("rtt") or line.startswith("round-trip"):
+                        try:
+                            avg = float(line.split("=")[1].strip()
+                                        .split()[0].split("/")[1])
+                            dt = int(round(avg))
+                        except (IndexError, ValueError):
+                            pass
+                        break
+            except (subprocess.SubprocessError, OSError):
+                pass
+            # Fallback TCP (min de 3 essais) si ICMP bloqué.
+            if dt is None:
+                samples = []
+                for _ in range(3):
+                    t0 = time.time()
+                    try:
+                        with socket.create_connection(
+                                (s.conn["host"], int(s.conn["port"])),
+                                timeout=1.5):
+                            samples.append(int((time.time() - t0) * 1000))
+                    except OSError:
+                        pass
+                dt = min(samples) if samples else None
 
             def commit():
                 s.latency_ms = dt
@@ -3055,15 +3078,17 @@ echo OK
         sh = screen.get_height() if screen else 1080
 
         def launch():
+            t_start = time.time()
             try:
                 with socket.create_connection(
-                        (conn["host"], int(conn["port"])), timeout=2.5):
+                        (conn["host"], int(conn["port"])), timeout=1.5):
                     pass
             except OSError as e:
                 log_session("failed", conn, str(e))
                 GLib.idle_add(self._show_error, s,
                               f"Hôte injoignable : {conn['host']}:{conn['port']}")
                 return
+            tcp_ms = int((time.time() - t_start) * 1000)
             xid = s.socket.get_id()
             home = os.path.expanduser("~")
             profile = (self._perf_profile or "tranquille").lower()
@@ -3111,6 +3136,13 @@ echo OK
             launch_cmd = rdp_wrap_realtime(cmd, perf)
             try:
                 s.proc = subprocess.Popen(launch_cmd)
+                spawn_ms = int((time.time() - t_start) * 1000)
+                print(f"[vmshell] RDP launch: TCP probe={tcp_ms} ms, "
+                      f"xfreerdp spawned at +{spawn_ms} ms, "
+                      f"profil={profile}, "
+                      f"ultra={bool(user.get('rdp_ultra_latency'))}, "
+                      f"codec={perf['codec']}, net={perf['network']}",
+                      flush=True)
                 log_session("start", conn)
                 if profile == "gamer":
                     freeze_background_apps()
